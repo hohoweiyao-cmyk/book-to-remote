@@ -35,12 +35,20 @@ const result = await evalJS(`(async () => {
   const file = new File([bytes], ${JSON.stringify(name)}, {type: 'application/epub+zip'});
   const dt = new DataTransfer();
   dt.items.add(file);
-  const zone = document.querySelector('.s2k-dnd-container') || document.querySelector('[class*=s2k-dnd]');
+  // 真实拖放区。旧版用 '[class*=s2k-dnd]' 会误匹配 .s2k-dnd-hero-image（装饰图），
+  // drop 打到错误元素上却仍返回 "dropped"，属于静默失败。这里按优先级取最内层真容器。
+  const zone = document.querySelector('#s2k-dnd-area')
+    || document.querySelector('.s2k-dnd-box')
+    || document.querySelector('.stk-dnd-home-functioning-area')
+    || document.querySelector('.s2k-wrapper');
   if (!zone) return 'no-zone';
   const opts = {bubbles: true, cancelable: true, dataTransfer: dt};
-  zone.dispatchEvent(new DragEvent('dragenter', opts));
-  zone.dispatchEvent(new DragEvent('dragover', opts));
-  zone.dispatchEvent(new DragEvent('drop', opts));
-  return 'dropped ' + file.name + ' ' + file.size + 'B';
+  const targets = [zone, zone.parentElement].filter(Boolean);
+  for (const t of targets) {
+    t.dispatchEvent(new DragEvent('dragenter', opts));
+    t.dispatchEvent(new DragEvent('dragover', opts));
+    t.dispatchEvent(new DragEvent('drop', opts));
+  }
+  return 'dropped ' + file.name + ' ' + file.size + 'B -> ' + zone.id + '.' + zone.className;
 })()`);
 console.log(result);

@@ -17,6 +17,7 @@ agent_created: true
 | 会弹窗抢本机使用吗？ | **不会**。不再新开浏览器，而是复用用户已开启调试端口的 Chrome，用 `background: true` 的**后台标签页**完成搜索与下载。 |
 | 用哪个域名？ | 只用官方客户端下发的权威域名（首选 `z-lib.sk`）。**已剔除 `z-library.ec`**——该域被 Cloudflare 标记为 `Suspected Phishing`。 |
 | 对浏览器有什么要求？ | **必须是 Chromium 系**（Chrome / Edge / Chromium）**且已手动开启远程调试**。Safari 与 Firefox 不支持，见下方「浏览器前置条件」——这是新环境最容易卡住的一关。 |
+| Kindle 走邮件还是网页投送？ | **默认邮件（7A）**。邮件走不通时先**引导用户完成亚马逊配置（7A-0）**，而不是直接降级。**仅两种情况**才用网页投送：① 文件 > 5.25MB（邮件上传实测上限）；② 用户**明确拒绝**配置。用户沉默 ≠ 拒绝，须等待。详见步骤 7 的「投送路由硬规则」。 |
 
 ---
 
@@ -89,6 +90,12 @@ node "$SKILL/scripts/zlib-cdp.mjs" download --id <id> --hash <hash> --out "$HOME
 # 6) 校验后再投送
 node "$SKILL/scripts/verify-ebook.mjs" "$HOME/Downloads/书名.epub"
 ```
+
+**投送阶段的顺序（先把邮件路的配置一次做齐，之后每本书都省事）**：
+
+1. 微信读书导入（步骤 6）。
+2. **Kindle 走邮件优先**：先跑 7A-0 的三项检查 → 需要用户动手的只有「把发件地址加入亚马逊白名单」这一条，**一次配好长期有效**。
+3. 体积 >5.25MB 或用户明确拒绝配置时，才切 7B 网页投送。
 
 ---
 
@@ -205,11 +212,52 @@ node "<skill_dir>/scripts/verify-ebook.mjs" <文件路径>
 - Chrome 会限流后台标签，上传卡 ~49% 是**被限速不是失败**，把上传页标签切前台（或让用户点一下）几秒即传完。
 - 上传超时点「重试」，前台重传很快。
 
-### 步骤 7：导入 Kindle —— 二选一
+### 步骤 7：导入 Kindle —— 邮件优先，网页兜底
 
-#### 7A. 邮件投送（推荐，最省事、最稳）
+#### 投送路由硬规则（不得违反）
 
-前置：**Agent Mail 连接器已开通**（用户侧开通，非 skill 负责）。
+1. **默认且首选邮件投送（7A）**。这是标准路径，不因"网页投送不用配置"就抄近路。
+2. 邮件路走不通时，**先引导用户完成亚马逊侧配置（7A-0）**，把配置当成任务的一部分去推进——而不是直接降级。配置是**一次性**的，配完以后每本书都省事。
+3. **只有下面两种情况**才允许切到网页投送（7B），进入前必须能明确指出是哪一条：
+   - **(a) 体积超限**：文件大于邮件上传的实测上限 ~5.25MB（见 7A 第 6 条），邮件路物理上走不通；
+   - **(b) 用户明确拒绝**：用户被引导后**明确表态**不愿配置（"不想弄"、"太麻烦"、"跳过吧"、"就用网页"）。
+4. **用户沉默 ≠ 拒绝**。若已发出配置引导但用户还没回，**停下等待**，不得自行降级；也**不得**用"网页投送也能成"来自我合理化跳过引导。
+5. 降级后必须在最终汇报里写明走的哪条路、为什么，以及让用户知道"以后配一次就能默认走邮件"。
+
+#### 7A-0. 前置：引导用户完成亚马逊必要配置（走邮件路的必过关卡）
+
+三项逐项查，缺哪补哪：
+
+| # | 检查项 | 怎么查 | 缺了怎么办 |
+|---|--------|--------|-----------|
+| 1 | Agent Mail 连接器已开通 | 调 `GetMe` | 用户侧开通，skill 无法代劳；明确告知并暂停 |
+| 2 | Kindle 收件地址 `kindle_email` 已固化到本地配置 | `check`（脱敏显示）或读 `~/.workbuddy/zlibrary/config.local.json` | 见 7A-0.1，**能代读就代读** |
+| 3 | Agent Mail 发件地址已在亚马逊「已批准的个人文档电子邮件发送列表」 | CDP 读 pdoc 页，看正文是否出现 `agent_mail_sender` | **只能用户手动添加**，见 7A-0.2 |
+
+**7A-0.1 拿 Kindle 收件地址（优先自动读，别让用户抄）**
+
+用 CDP 打开 `https://www.amazon.com/hz/mycd/myx#/home/settings/pdoc`，`/eval` 抓 `/[A-Za-z0-9._%+-]+@kindle\.com/i`，拿到后 `setup --kindle-email <它>` 写入本地配置。
+取不到（未登录 / 页面改版）再让用户手抄，话术见上文「给『别人用这个 skill』的引导话术」。
+
+**7A-0.2 白名单引导（唯一必须用户亲自动手的一步）**
+
+- **先自动查，能省则省**：同一 pdoc 页面上若正文已出现 `agent_mail_sender`，说明早就放行过 → **直接进 7A，不要打扰用户**。
+- **没出现时**，先用下列模板向用户说明并**停下来等回复**：
+
+  > 我需要用 `<发件地址>`（脱敏显示）给你投书到 Kindle，但亚马逊只接收白名单里的发件人。
+  > 请做一次设置（**一次性，之后长期有效**）：
+  > 亚马逊 → 管理你的内容和设备 → 偏好设置 → 个人文档设置 → 「已批准的个人文档电子邮件发送列表」→ 添加 `<发件地址>`。
+  > 加好后回我一声，我立刻投书。
+  > 如果你不想做这一步，我也可以改用「Send to Kindle 网页投送」代替——效果一样，只是每次要多在网页上确认一次设备。
+
+- 用户回复后的分支：
+  - **配置完成** → 重新查白名单确认已放行 → 进 7A。
+  - **明确拒绝** → 记下"用户拒绝配置"这一事实，切 7B，并在汇报中说明。
+  - **没回** → 继续等，不降级。
+
+#### 7A. 邮件投送（默认路径，≤ 5.25MB）
+
+前置：**Agent Mail 连接器已开通**（用户侧开通，非 skill 负责）且 7A-0 三项已通过。
 
 1. 收件地址从本地配置 `kindle_email` 取（`setup` 时已固化，见上文引导）；没有就先补。
    - 替代法：CDP 打开 `https://www.amazon.com/hz/mycd/myx#/home/settings/pdoc`，`/eval` 抓 `/[A-Za-z0-9._%+-]+@kindle\.com/i`。
@@ -227,9 +275,19 @@ node "<skill_dir>/scripts/verify-ebook.mjs" <文件路径>
 5. 会返回 `CONFIRMATION_REQUIRED` + `confirmation_token` → 先向用户展示 operation_summary（发件人／收件人／主题／附件数四行表格）并**明确请求确认**，得到同意后带 `confirmation_token` 重发。
    - **令牌有效期只有约 5 分钟**（看 `expires_at`），且每次调用都会刷新一个新令牌。若用户回复慢导致过期，重新发一次不带 token 的请求拿新令牌即可，别卡在旧令牌上重试。
 6. 返回 `queued:true` 即成功。**最后一定要核验**：`ListMessages {dir:"sent", limit:3}` 确认该封邮件的 `to` / `subject` / `has_attachments:true` 都在，再提示用户 Kindle 联网后稍候自动同步。
-   - 附件上限 20MB（`GetMe` 的 `max_attachment_size_bytes`），epub 通常远远够用；超限才退到网页投送。
+   - ⚠️ **上传路径的真实体积上限约 5.25MB，不是 `GetMe` 宣称的 20MB**（2026-09-16 实测二分定位：5.0MB 通过，5.5MB 失败，报 `400 Validation failed on field: xmail.UploadFileReq.content`）。推测是上传接口对 base64 内容设了 7MB 上限（7MB×3/4 = 5.25MB）。
+     - 判定方法：`agent_mail_upload_attachment` 一把过；报 `Validation failed on field: xmail.UploadFileReq.content` 即超限，**换网页投送，别反复重试**。
+     - 注意另一个易混错误：`blocked attachment: file extension ".bin" is not allowed` 是扩展名被拒，与体积无关。
+     - 中文文件名不是问题（实测 6.25MB 中文名与 ASCII 名同样报 content 校验错），无需改名。
+   - **体积分流规则**：epub ≤ 5MB → 走 7A 邮件；> 5MB → 走 7B 网页投送（限 200MB）。**这是路由硬规则的 (a) 条**，属于物理限制，不需要征求用户同意，但要在汇报里说明。不要试图压缩正文换体积。
 
-#### 7B. 网页投送 Send to Kindle（CDP）
+#### 7B. 网页投送 Send to Kindle（兜底路径；限 200MB）
+
+**准入检查（进入前自检，说得出是哪一条才准进）**：
+- (a) 文件 > 5.25MB → 邮件上传上限，物理不可行；或
+- (b) **用户已明确表示不愿配置**亚马逊收件地址/发件白名单。
+
+**不满足上述任一条就不许走 7B**——尤其不能因为"网页投送少一次用户交互"而默认选它。用户沉默时回到 7A-0.2 继续等。
 
 1. 仅 epub/pdf/doc/docx/txt（≤200MB）；**mobi/azw3 禁止网页上传**。
 2. CDP 新建 tab：`https://www.amazon.com/sendtokindle`，`/eval` 判登录态。
@@ -238,9 +296,22 @@ node "<skill_dir>/scripts/verify-ebook.mjs" <文件路径>
    node "<skill_dir>/scripts/stk-drop.mjs" <targetId> <文件绝对路径> [文件名]
    ```
    （页面内 `fetch` 本地文件会被浏览器代理拦，只能用注入方式。）
-4. 文件注入后设备选择区才出现；若 "No devices found" → 去 `https://www.amazon.com/hz/mycd/digital-console/devicelist` 确认有 Kindle，再回上传页重注入。
-5. 发送后书只进 **Docs 库**，还需对每本点 **Deliver to device → 勾选设备复选框 → Make Changes**。**漏勾设备复选框会静默不生效**。
-6. 投递后 "In 1 Device" 标签延迟刷新，刷新页面再确认。
+4. **拖放目标必须先确认**。2026-09 版页面真实拖放区是 `#s2k-dnd-area`（class `s2k-dnd-box`）。
+   - ⚠️ **旧版脚本的选择器 `[class*=s2k-dnd]` 会误命中 `.s2k-dnd-hero-image`（装饰大图）**，drop 打空却仍返回 `"dropped ..."`——典型静默失败。已在 `stk-drop.mjs` 修成 `#s2k-dnd-area → .s2k-dnd-box → .stk-dnd-home-functioning-area → .s2k-wrapper` 的优先级链，并把返回值改成带目标 id/class（便于肉眼核验）。
+   - **判定成功的标志**：`.stk-dnd-home-functioning-area` 文本从 `Drag and drop files here` 变为 `Ready to Send | <文件名> | <体积>`。只看到 `"dropped"` 不代表成功。
+5. 点 `#s2k-r2s-send-button`（Send）。成功后同一区域出现 `Your files are on the way`，右下「Recently sent files」新增一行 `<书名> | Send-to-Kindle for Web | Processing`。
+   - **轮询不要把整段文本做 `includes("In library")` 匹配**——列表里历史条目也含该词，会假阳性。要按行取：`[...document.querySelectorAll("table tr")]` 常常取不到（该列表不是 table），稳妥做法是截取 `Just now` 之后的 120 字符再判断。
+6. 等该行从 `Processing` → `In library`（约 1–2 分钟），书即进入 **Docs 库**。
+7. **再做 Deliver to device**，确保推到具体设备：
+   - 打开 `https://www.amazon.com/hz/mycd/digital-console/contentlist/pdocs/dateDsc/`（从内容页点 **Docs → See N Title(s)** 也能进；直接访问 `.../contentlist/docs` 会被重定向到 `allcontent`）。
+   - 每本书的操作是 `<div class="action_button" id="<随机串>">Deliver to device</div>`。**`/click`（JS el.click()）点不动它**，要用 `/clickAt`（真鼠标事件）。
+   - 弹窗是**原生 `<dialog>`**，不在 iframe/shadow DOM 里，直接 `document.querySelectorAll("dialog[open]")` 可取；用 `innerText.includes("<书名>")` 定位到本书那个 dialog，**别用 id 反查**（同一个 row button 与 dialog 的 id 前缀不同，如 row 是 `b4btlhxs`、dialog 是 `pjt1ukcn`）。
+   - 复选框：`input` 带 `tabindex="-1" aria-hidden="true"`，**点 input 无效**。要点它的视觉替身 `span#<listId>_0_checkmark`（`role="checkbox"`）。核验 `aria-checked === "true"`。
+   - 确认按钮是 dialog 内的 `<随机串>_CONFIRM`。成功标志：弹窗变 `Request submitted — Request to deliver <书名> has been sent`。
+   - 多本批量时每个 dialog 的 id 都不同，必须逐本按书名定位。
+8. 卡住时的排查顺序：拿不到 dialog → 先 `/screenshot` 看真实画面（DOM 查询常因未 attach 的 dialog 而漏判）；确认无误但状态没变 → 刷新页面重读。
+
+> 网络请求全程由页面自身发起；Chrome 后台标签的定时器节流**不影响**这里的同步事件处理，所以无需切前台（微信读书上传则相反，见步骤 6 的 49% 限流坑）。
 
 ### 步骤 8：验证
 
@@ -278,10 +349,19 @@ node "<skill_dir>/scripts/verify-ebook.mjs" <文件路径>
 | 下载目录不是 `~/Downloads` | 脚本会自动读 Chrome `Preferences.download.default_directory`；也可 `setup --download-dir` 指定 |
 | 同名书 20 个版本不知选哪个 | 拆包比正文字数 + 看末章结尾 + `file` 看封面 EXIF，避开带公众号广告的「精排」本 |
 | 微信读书上传卡 49% | 切前台标签重试 |
-| Send to Kindle 找不到文件输入框 | 用 `stk-drop.mjs` 注入 drop |
-| Send to Kindle 显示 No devices | 内容管理页确认有 Kindle 后重注入 |
-| Kindle 投递后设备无书 | 未 Deliver to device 或漏勾设备复选框 |
+| 微信读书上传：`/click` 传选择器没用 | 上传框是 `input[type=file]`，用 `/setFiles`（POST body `{"selector":"input[type=file]","files":["绝对路径"]}`），不是 `/click` |
+| Send to Kindle 找不到文件输入框 | 用 `stk-drop.mjs` 注入 drop；**真实目标 `#s2k-dnd-area`**，脚本返回 `no-zone` 或 drop 后页面仍显示 `Drag and drop files here` 都是失败 |
+| `stk-drop.mjs` 返回 dropped 但页面无反应 | 旧选择器命中 `.s2k-dnd-hero-image` 装饰图所致，已修；确认返回值里带 `#s2k-dnd-area` |
+| 判定 Send 后是否入库时误报成功 | 别对整段文本 `includes("In library")`（历史条目会命中），按行/按 `Just now` 后窗口判断 |
+| `Deliver to device` 按钮 el.click() 点不动 | 该按钮是 React `<div class="action_button">`，必须用 `/clickAt` 发真鼠标事件 |
+| 投送弹窗里勾了设备但没生效 | `input[type=checkbox]` 是 `aria-hidden`，要点 `span#<listId>_0_checkmark`；勾选后核验 `aria-checked==="true"` |
+| mycd 页面找不到书 | 直接访问 `.../contentlist/docs` 会跳 `allcontent`；用 `.../contentlist/pdocs/dateDsc/` |
 | 邮件投送被拒收 | 发件地址未加入亚马逊「已批准的个人文档电子邮件发送列表」 |
+| 想抄近路直接用网页投送 | 违反投送路由硬规则。只有 `>5.25MB` 或**用户明确拒绝配置**才允许；先做 7A-0 引导 |
+| 引导用户配置后用户没回 | **停下等待**，不得自行降级。用户沉默 ≠ 拒绝；沉默时也别说"那我用网页投送吧" |
+| 用户拒绝了配置，下次还要问吗 | 不用重问。但要在汇报里提醒：以后想走邮件只需补一次白名单设置 |
+| `agent_mail_upload_attachment` 报 `Validation failed ... UploadFileReq.content` | 附件超过上传真实上限 ~5.25MB，改走 7B 网页投送（或换更小体积的版本） |
+| `agent_mail_upload_attachment` 报 `blocked attachment: file extension` | 扩展名不在白名单（如 `.bin`），与体积无关 |
 | `SendMessage` 报 schema 错 | `to` 必须是 `[{email}]` 数组，附件用 `file_refs` |
 | 邮件正文空报错 | 正文不能为空，加占位文字 |
 | 确认令牌失效 | 令牌约 5 分钟过期；重发一次不带 token 的请求取新令牌 |
@@ -294,6 +374,8 @@ node "<skill_dir>/scripts/verify-ebook.mjs" <文件路径>
 - **不要把 skill 目录里的任何文件改成含真实邮箱/凭据**——这个目录会被同步到 GitHub。
 - 不替用户输任何密码/验证码/passkey；登录墙一律引导用户自己完成（`login` 只负责轮询抓取，不碰输入）。
 - cookie 注入是写进用户自己的浏览器、用户自己的账号，属于正常登录态；`login` 抓取同理。不做任何形式的凭据外传。
+- **投送方式不得静默降级**：Kindle 默认走邮件投送；**禁止**因为"网页投送不需要用户配置"就绕过 7A-0 的引导直接选网页。降级只有两条合法理由（体积 >5.25MB、用户明确拒绝配置），且必须在汇报里说明理由。用户不回应时**等待**，不要替他做决定。
+- **引导配置要一次说清、只说一遍**：把「做什么 + 为什么 + 一次性长期有效 + 不想做的替代方案」四件事放在同一条消息里，避免反复追问消耗用户耐心。用户拒绝后不再重复劝说。
 - 每次上传/投送前重核对文件名；交互后刷新页面状态，不复用过期元素。
 - 任务结束用 `/close` 关闭自己创建的后台 tab，保留用户原有 tab。
 - 批量 ≤5 本/批，控制反爬节奏。
