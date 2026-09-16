@@ -1,3 +1,9 @@
+// ⚠️ 降级为「兜底脚本」（2026-09-16 重构）
+//   正常请用 zlib-cdp.mjs：它复用用户已开的 Chrome 后台标签页，静默下载，不弹窗口、不抢焦点。
+//   本脚本改用 Playwright 启动一个【非无头新 Chrome 窗口】来下载 —— 会弹窗抢占本机使用，只在
+//   CDP 代理不可用时作为兜底。为什么不能无头：实测 bundled-chromium-headless 与 chrome-headless
+//   都会拿到 "Try again later"（反爬识别），必须非无头真实 Chrome。
+//
 // zlib-browser-dl.mjs — 用 Playwright 过 Z-Library /dl 的 JS 盾并下载
 // 用法: node zlib-browser-dl.mjs "<搜索词>" "<输出路径.epub>" [格式epub]
 // playwright 加载：ESM 不吃 NODE_PATH，用 createRequire 从 workspace 解析主包（拿 chromium）
@@ -20,10 +26,27 @@ try {
   }
 }
 
-const cfgPath = homedir() + '/Library/Application Support/z-library/config.json';
-const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
-const uid = cfg.remix_userid || cfg.userid;
-const key = cfg.remix_userkey || cfg.userkey;
+// 凭据来源：优先本 skill 的本地私有配置，其次 Z-Library.app 的配置
+// —— 这样即使没装 APP 也能用（本地配置由 zlib-cdp.mjs login 生成）
+const localCfgPath = homedir() + '/.workbuddy/zlibrary/config.local.json';
+const appCfgPath = homedir() + '/Library/Application Support/z-library/config.json';
+let uid, key, cfg = {};
+if (existsSync(localCfgPath)) {
+  const lc = JSON.parse(readFileSync(localCfgPath, 'utf8'));
+  uid = lc?.credentials?.remix_userid;
+  key = lc?.credentials?.remix_userkey;
+  cfg = lc;
+}
+if ((!uid || !key) && existsSync(appCfgPath)) {
+  const ac = JSON.parse(readFileSync(appCfgPath, 'utf8'));
+  uid = uid || ac.remix_userid || ac.userid;
+  key = key || ac.remix_userkey || ac.userkey;
+  cfg.domains = ac.domains || [];
+}
+if (!uid || !key) {
+  console.error('缺少凭据：请先运行 `node zlib-cdp.mjs login`（浏览器登录）或 `import-app`');
+  process.exit(2);
+}
 
 const [query, outPath, format = 'epub'] = process.argv.slice(2);
 if (!query || !outPath) {
@@ -32,7 +55,8 @@ if (!query || !outPath) {
 }
 
 // 域名自适应：优先 env，其次从 app config 的 domains 里挑一个可用的（过滤 onion/books）
-const PREFERRED = ['z-library.ec', 'z-lib.sk', 'z-library.sk', 'z-lib.fm', 'z-lib.gd', 'z-lib.gl'];
+// 官方权威域名，已移除 z-library.ec（Cloudflare 标记为钓鱼）
+const PREFERRED = ['z-lib.sk', 'z-lib.fm', 'z-library.sk', 'z-lib.gd', 'z-lib.gl', 'z-lib.do'];
 const cfgDomains = (cfg.domains || []).filter((d) => !d.includes('.onion') && !d.includes('books'));
 const candidateHosts = [...new Set([...(process.env.ZLIB_DOMAIN ? [process.env.ZLIB_DOMAIN] : []), ...PREFERRED, ...cfgDomains])];
 let DOMAIN = null;
