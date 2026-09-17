@@ -70,6 +70,7 @@ node "$SKILL/scripts/cdp.mjs" bootstrap    # 一次性部署
 | **新增 `show <target>` 与 `front <target>`** | 需要用户亲自登录时，窗口得挪回屏幕内并置顶；`hideWindows` 只负责挪到屏外，缺反向操作。配合 `CDP_NO_HIDE=1` 环境变量，避免用户正在填的窗口被后续命令又挪走 |
 | **记录 `sync-cookies` / `prune` 必须先 `kill`** | 实例运行时会回写 Cookies 并锁住缓存目录，边跑边覆盖等于白做（脚本会拒绝并提示） |
 | **记录亚马逊 `/hz/mycd/*` 周期性强制重登** | 同一实例里 `sendtokindle` 显示已登录、`mycd` 却跳 `Amazon Sign-In`。**这不是 cookie 迁移失败**，重跑 `sync-cookies` 无效，需用户在专用实例里登一次 |
+| **更正「邮件投送无法云端核验」的旧说法** | 实测反例：邮件投出后，`.../contentlist/pdocs/dateDsc/` 列表里会直接出现「书名 + 作者 + 体积 + `Created on <日期>`」。**接收侧核验是可行的，而且比 `sent` 目录强**——`sent` 只能证明信寄出去了，`pdocs` 能证明亚马逊收下并放行。两层都要做 |
 
 > 结论：Z-Library 与微信读书的登录态靠 cookie 迁移就能长期稳定；**亚马逊是唯一可能需要用户偶尔登录一次**的站点——它除了轮转 `session-token`/`at-main`，还会对账号页强制重登。
 

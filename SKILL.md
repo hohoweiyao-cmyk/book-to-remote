@@ -383,7 +383,10 @@ node "<skill_dir>/scripts/cdp.mjs" close "$T"
    ```
 5. 会返回 `CONFIRMATION_REQUIRED` + `confirmation_token` → 先向用户展示 operation_summary（发件人／收件人／主题／附件数四行表格）并**明确请求确认**，得到同意后带 `confirmation_token` 重发。
    - **令牌有效期只有约 5 分钟**（看 `expires_at`），且每次调用都会刷新一个新令牌。若用户回复慢导致过期，重新发一次不带 token 的请求拿新令牌即可，别卡在旧令牌上重试。
-6. 返回 `queued:true` 即成功。**最后一定要核验**：`ListMessages {dir:"sent", limit:3}` 确认该封邮件的 `to` / `subject` / `has_attachments:true` 都在，再提示用户 Kindle 联网后稍候自动同步。
+6. 返回 `queued:true` 即成功。**最后一定要核验**，两层都做：
+   - **发出侧**：`ListMessages {dir:"sent", limit:3}` 确认该封邮件的 `to` / `subject` / `has_attachments:true` 都在。
+   - **接收侧（更强，别省）**：打开 `.../contentlist/pdocs/dateDsc/` 看列表里是否出现该书（详细做法见步骤 8）。**只有这一层能证明亚马逊真的收下并放行**——`sent` 目录只能证明"信寄出去了"。
+   - 两层都过，再提示用户 Kindle 联网后稍候自动同步。
    - ⚠️ **上传路径的真实体积上限约 5.25MB，不是 `GetMe` 宣称的 20MB**（2026-09-16 实测二分定位：5.0MB 通过，5.5MB 失败，报 `400 Validation failed on field: xmail.UploadFileReq.content`）。推测是上传接口对 base64 内容设了 7MB 上限（7MB×3/4 = 5.25MB）。
      - 判定方法：`agent_mail_upload_attachment` 一把过；报 `Validation failed on field: xmail.UploadFileReq.content` 即超限，**换网页投送，别反复重试**。
      - 注意另一个易混错误：`blocked attachment: file extension ".bin" is not allowed` 是扩展名被拒，与体积无关。
@@ -441,8 +444,16 @@ node "<skill_dir>/scripts/cdp.mjs" close "$T"
 ### 步骤 8：验证
 
 - 微信读书：书架出现书名 = 成功。
-- Kindle 邮件投送：用户 Kindle 上确认为准（云端无法直接观测，如实说明；但 sent 目录 + 附件可核验已发出）。
-- Kindle 网页投送：`docsAll` 列表出现书名，且完成 Deliver to device。
+- Kindle 邮件投送：**云端可观测，不必只靠用户确认**（2026-09-17 更正）。投出后打开
+  `https://www.amazon.com/hz/mycd/digital-console/contentlist/pdocs/dateDsc/`，列表里出现「书名 + 作者 + 体积 + `Created on <日期>`」即说明亚马逊**已收下并入库**——这比"只核验 sent 目录"强得多，因为它证明白名单放行、附件被接受。
+  ```bash
+  T=$(node "<skill_dir>/scripts/cdp.mjs" new "https://www.amazon.com/hz/mycd/digital-console/contentlist/pdocs/dateDsc/")
+  node "<skill_dir>/scripts/cdp.mjs" eval "$T" 'document.body.innerText.includes("<书名>")'
+  node "<skill_dir>/scripts/cdp.mjs" close "$T"
+  ```
+  > 注意这一步依赖 `/hz/mycd/*`，会被周期性强制重登挡住（见「常见故障速查」）。页面进不去时如实说明「已发出但无法云端核验」，别把"发信成功"说成"已到 Kindle"。
+  > 若列表里该书那行显示 `In N device` 之外的空白状态，可用同行 `Deliver to device` 手动推一台设备（按钮点法见 7B 第 7 条，必须用 `cdp.mjs clickat`）。
+- Kindle 网页投送：`pdocs` 列表出现书名，且完成 Deliver to device。
 
 ---
 
@@ -488,6 +499,7 @@ node "<skill_dir>/scripts/cdp.mjs" close "$T"
 | **打开 `/hz/mycd/*` 却跳到 `Amazon Sign-In`** | 亚马逊对「管理你的内容和设备」这类账号页会**周期性强制重登**——即使 `sendtokindle` 等普通页仍显示已登录（2026-09-17 实测：同一实例 `sendtokindle` 正常、`mycd` 跳登录）。判定方法：`document.title === 'Amazon Sign-In'` 或 `location.href.includes('/ap/signin')`。**这不是 cookie 迁移失败**，重跑 `sync-cookies` 也无效。处理：`cdp.mjs show <target>` 把登录页弹给用户，用户登一次即可（一次性）；期间轮询加 `CDP_NO_HIDE=1`。之后 7A-0 的 pdoc 页与 7B 的 Deliver to device 才能用 |
 | `sync-cookies` 报「专用实例正在运行…已中止」 | 设计如此：实例退出时会把自己的 Cookies 回写，覆盖会白做。先 `cdp.mjs kill`，再 `sync-cookies` |
 | 邮件投送被拒收 | 发件地址未加入亚马逊「已批准的个人文档电子邮件发送列表」（7A-0 第 3 项）。若 mycd 页跳登录导致无法核验，**不要假设已放行**，先把重登问题解决掉再投 |
+| `sent` 目录有信但 `pdocs` 列表没书 | 亚马逊静默丢弃（白名单未放行 / 附件体积超限 / 格式不支持）。**别只看 sent 就报成功**——两层核验都要做。重查 7A-0 第 3 项，或换更小的文件重投 |
 | 亚马逊 cookie 明明没过期却仍要登录 | 复制来的 `session-token` / `at-main` 是**轮转令牌**，日常 Chrome 那边的活动会让副本失效。`sync-cookies` 能救一时；要长期稳定，就让用户在专用实例里独立登录一次 |
 | 想抄近路直接用网页投送 | 违反投送路由硬规则。只有 `>5.25MB` 或**用户明确拒绝配置**才允许；先做 7A-0 引导 |
 | 引导用户配置后用户没回 | **停下等待**，不得自行降级。用户沉默 ≠ 拒绝；沉默时也别说"那我用网页投送吧" |
