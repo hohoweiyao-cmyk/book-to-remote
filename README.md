@@ -1,6 +1,11 @@
-# zlibrary-to-weread-kindle-wechatreader
+# book-to-remote
 
 WorkBuddy Skill：从 Z-Library 下载电子书，并导入微信读书（WeRead）和 Kindle 阅读器。
+
+> **改名说明（2026-09-17）**：本 skill 原名 `zlibrary-to-weread-kindle-wechatreader`，现更名为 **`book-to-remote`**。GitHub 仓库同步改名，旧链接由 GitHub 自动重定向。已有使用者把本地 skill 目录一并改名即可：
+> ```bash
+> mv ~/.workbuddy/skills/zlibrary-to-weread-kindle-wechatreader ~/.workbuddy/skills/book-to-remote
+> ```
 
 一条链路打通：**搜书下载 → 文件验证 → 微信读书导入 → Kindle 导入（邮件优先，网页兜底）**。
 
@@ -140,8 +145,8 @@ Kindle 收件地址、Agent Mail 发件地址、Z-Library 凭据统一存放在 
 ## 安装（供其他 Agent 使用）
 
 ```bash
-git clone https://github.com/hohoweiyao-cmyk/zlibrary-to-weread-kindle-wechatreader.git \
-  ~/.workbuddy/skills/zlibrary-to-weread-kindle-wechatreader
+git clone https://github.com/hohoweiyao-cmyk/book-to-remote.git \
+  ~/.workbuddy/skills/book-to-remote
 ```
 
 ## 其他依赖
@@ -159,7 +164,7 @@ git clone https://github.com/hohoweiyao-cmyk/zlibrary-to-weread-kindle-wechatrea
 ## 使用
 
 ```bash
-SKILL=~/.workbuddy/skills/zlibrary-to-weread-kindle-wechatreader
+SKILL=~/.workbuddy/skills/book-to-remote
 
 # 0) 确保 CDP 代理就绪
 node ~/.workbuddy/skills/web-access/scripts/check-deps.mjs

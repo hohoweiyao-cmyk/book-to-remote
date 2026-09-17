@@ -1,12 +1,17 @@
 ---
-name: zlibrary-to-weread-kindle-wechatreader
-description: 从 Z-Library 找书、静默下载 epub，再导入微信读书（WeRead）与 Kindle。不需要安装 Z-Library.app，不弹浏览器窗口、不抢本机焦点。触发词：zlibrary 下载、z-library 找书、下载电子书导入微信读书、传到 Kindle、send to kindle、导入 kindle、weread 导入、邮件投送 kindle。
+name: book-to-remote
+description: 从 Z-Library 找书、静默下载 epub，再导入微信读书（WeRead）与 Kindle。不需要安装 Z-Library.app，不弹浏览器窗口、不抢本机焦点。触发词：book-to-remote、zlibrary 下载、z-library 找书、下载电子书导入微信读书、传到 Kindle、send to kindle、导入 kindle、weread 导入、邮件投送 kindle。
 agent_created: true
 ---
 
-# Z-Library 下载 → 微信读书 / Kindle 导入
+# book-to-remote：找书下载 → 微信读书 / Kindle
 
-**搜书下载 → 文件验证 → 微信读书导入 → Kindle 导入（邮件投送 / 网页投送二选一）。**
+**搜书下载 → 文件验证 → 微信读书导入 → Kindle 导入（邮件优先，网页兜底）。**
+
+> **改名说明（2026-09-17）**：本 skill 原名 `zlibrary-to-weread-kindle-wechatreader`，现更名 `book-to-remote`。目录也需同名，否则 skill 无法被正确加载：
+> ```bash
+> mv ~/.workbuddy/skills/zlibrary-to-weread-kindle-wechatreader ~/.workbuddy/skills/book-to-remote
+> ```
 
 ## 架构要点（2026-09-16 重构，先看这段）
 
@@ -64,7 +69,7 @@ agent_created: true
 ## 快速开始（新用户照这个顺序走）
 
 ```bash
-SKILL=/Users/<你>/.workbuddy/skills/zlibrary-to-weread-kindle-wechatreader
+SKILL=/Users/<你>/.workbuddy/skills/book-to-remote
 
 # 0) 先确保 web-access 的 CDP 代理已连上用户浏览器
 #    本机已在 web-access/config.env 固定 WEB_ACCESS_BROWSER=chrome，直接跑即可（无需参数）
