@@ -95,6 +95,15 @@ node "$SKILL/scripts/cdp.mjs" new "https://z-lib.sk/"   # 开一个窗口，用�
 - **端侧模型要关掉**。启动参数里带了 `--disable-features=OptimizationGuideOnDeviceModel,OptimizationGuideModelDownloading,...`；不加的话 Chrome 会后台偷下端侧模型，实测 `OptGuideOnDeviceModel` 单目录吃到 **4.0G**。`node cdp.mjs prune` 可清理这类可再生缓存。
 - **换浏览器**：改 `~/.workbuddy/chrome-cdp/config.local.json` 的 `chrome_bin` 即可（任何 Chromium 系都行，不要求是用户的日常浏览器）。
 - **改端口**：同文件的 `port`，默认 `9444`（刻意避开 9222，避免和用户日常 Chrome 抢端口）。
+- **`cdp.mjs` 的每个业务子命令都会自动拉起实例**（`new` / `eval` / `nav` / `cookies` / `click` / `clickat` / `shot` / `setfiles` / `close` / `tabs`），冷机状态下直接敲就行，不必先 `ensure`。只有管理实例本身的命令不自动拉起：`check` / `bootstrap` / `ensure` / `sync-cookies` / `prune` / `kill`。
+- **`sync-cookies` 与 `prune` 必须先 `kill`**：实例运行时会回写 Cookies、并锁住缓存目录，边跑边覆盖等于白做。脚本会直接拒绝并提示。`zlib-cdp.mjs` 的自动拉起里已内置这两个动作，所以日常路径碰不到这个坑。
+- **需要用户亲自操作时（登录 / 过验证码）**：`cdp.mjs show <target>` 把窗口挪回屏幕内并置顶（`new` 建的是后台标签、窗口默认在屏外）。**用户操作期间的所有 `cdp.mjs` 调用都要加 `CDP_NO_HIDE=1`**，否则自动隐藏会把用户正在填的窗口又挪走：
+  ```bash
+  T=$(node "$SKILL/scripts/cdp.mjs" new "<登录页>")
+  node "$SKILL/scripts/cdp.mjs" show "$T"          # 弹出可见窗口，交给用户
+  CDP_NO_HIDE=1 node "$SKILL/scripts/cdp.mjs" eval "$T" '<判登录态>'   # 期间轮询都要带这个前缀
+  ```
+  用户操作完，关掉标签即可；下一个自动化命令会照常把窗口移回屏外。`front <target>` 是更轻的版本（只切前台、不改位置），用于后台限速卡住的兜底。
 
 ### 已废弃：常驻代理 + 弹窗自动点击（2026-09-17 弃用，勿重做）
 
@@ -160,7 +169,12 @@ node "$SKILL/scripts/verify-ebook.mjs" "$HOME/Downloads/书名.epub"
 
 1. 微信读书导入（步骤 6）。
 2. **Kindle 走邮件优先**：先跑 7A-0 的三项检查 → 需要用户动手的只有「把发件地址加入亚马逊白名单」这一条，**一次配好长期有效**。
+   - ⚠️ 这一条要在 `/hz/mycd/*` 页面上核验，而亚马逊对该路径**会周期性强制重登**。遇到跳登录页时按「常见故障速查」那一行的办法处理，**别把它当成 cookie 迁移失败**。
 3. 体积 >5.25MB 或用户明确拒绝配置时，才切 7B 网页投送。
+
+> **亚马逊与另两个站点的差别（2026-09-17 实测）**：Z-Library 与微信读书的登录态靠 cookie 迁移就能长期稳定；
+> 亚马逊除了 cookie 轮转（`session-token`/`at-main`）还会对账号页强制重登，所以它**是唯一可能需要用户
+> 偶尔登录一次**的站点。想彻底省掉，就让用户在**专用实例**里独立登录一次亚马逊。
 
 ---
 
@@ -280,7 +294,7 @@ node "<skill_dir>/scripts/verify-ebook.mjs" <文件路径>
 
 ```bash
 SKILL=~/.workbuddy/skills/book-to-remote
-node "$SKILL/scripts/cdp.mjs" ensure
+node "$SKILL/scripts/cdp.mjs" ensure                                  # 可省：new 也会自动拉起
 T=$(node "$SKILL/scripts/cdp.mjs" new "https://weread.qq.com/web/upload")   # 直达上传页，别找书架弹窗
 
 # 判登录态（wr_vid 是 httpOnly，只能用 CDP 读，document.cookie 看不到）
@@ -328,6 +342,11 @@ node "<skill_dir>/scripts/cdp.mjs" eval "$T" 'JSON.stringify((document.body.inne
 node "<skill_dir>/scripts/cdp.mjs" close "$T"
 ```
 拿到后 `setup --kindle-email <它>` 写入本地配置。取不到（未登录 / 页面改版）再让用户手抄，话术见上文「给『别人用这个 skill』的引导话术」。
+
+> ⚠️ **先判是不是被弹去登录页**：亚马逊会周期性对 `/hz/mycd/*` 强制重登。若 `eval` 拿到的
+> `document.title` 是 `Amazon Sign-In`、或 `location.href` 含 `/ap/signin`，说明**这一页进不去**——
+> 此时**不要**据此判定「未登录」或「cookie 迁移失败」，更不要反复重试。正确动作：告知用户需在专用实例里
+> 登录一次亚马逊（一次性），或改用本地配置里已有的 `kindle_email` 继续。
 
 **7A-0.2 白名单引导（唯一必须用户亲自动手的一步）**
 
@@ -466,7 +485,10 @@ node "<skill_dir>/scripts/cdp.mjs" close "$T"
 | `Deliver to device` 按钮 el.click() 点不动 | 该按钮是 React `<div class="action_button">`，必须用 `cdp.mjs clickat` 派发真鼠标事件 |
 | 投送弹窗里勾了设备但没生效 | `input[type=checkbox]` 是 `aria-hidden`，要点 `span#<listId>_0_checkmark`；勾选后核验 `aria-checked==="true"` |
 | mycd 页面找不到书 | 直接访问 `.../contentlist/docs` 会跳 `allcontent`；用 `.../contentlist/pdocs/dateDsc/` |
-| 邮件投送被拒收 | 发件地址未加入亚马逊「已批准的个人文档电子邮件发送列表」 |
+| **打开 `/hz/mycd/*` 却跳到 `Amazon Sign-In`** | 亚马逊对「管理你的内容和设备」这类账号页会**周期性强制重登**——即使 `sendtokindle` 等普通页仍显示已登录（2026-09-17 实测：同一实例 `sendtokindle` 正常、`mycd` 跳登录）。判定方法：`document.title === 'Amazon Sign-In'` 或 `location.href.includes('/ap/signin')`。**这不是 cookie 迁移失败**，重跑 `sync-cookies` 也无效。处理：`cdp.mjs show <target>` 把登录页弹给用户，用户登一次即可（一次性）；期间轮询加 `CDP_NO_HIDE=1`。之后 7A-0 的 pdoc 页与 7B 的 Deliver to device 才能用 |
+| `sync-cookies` 报「专用实例正在运行…已中止」 | 设计如此：实例退出时会把自己的 Cookies 回写，覆盖会白做。先 `cdp.mjs kill`，再 `sync-cookies` |
+| 邮件投送被拒收 | 发件地址未加入亚马逊「已批准的个人文档电子邮件发送列表」（7A-0 第 3 项）。若 mycd 页跳登录导致无法核验，**不要假设已放行**，先把重登问题解决掉再投 |
+| 亚马逊 cookie 明明没过期却仍要登录 | 复制来的 `session-token` / `at-main` 是**轮转令牌**，日常 Chrome 那边的活动会让副本失效。`sync-cookies` 能救一时；要长期稳定，就让用户在专用实例里独立登录一次 |
 | 想抄近路直接用网页投送 | 违反投送路由硬规则。只有 `>5.25MB` 或**用户明确拒绝配置**才允许；先做 7A-0 引导 |
 | 引导用户配置后用户没回 | **停下等待**，不得自行降级。用户沉默 ≠ 拒绝；沉默时也别说"那我用网页投送吧" |
 | 用户拒绝了配置，下次还要问吗 | 不用重问。但要在汇报里提醒：以后想走邮件只需补一次白名单设置 |

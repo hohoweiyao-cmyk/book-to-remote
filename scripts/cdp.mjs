@@ -299,16 +299,31 @@ export async function applyDownloadBehavior(dir) {
 }
 
 /** 兜底：把可能出现的窗口挪到屏幕外（窗口最小化 CDP 无效，只能挪） */
-export async function hideWindows() {
+export async function hideWindows({ except } = {}) {
   const cdp = await connect();
   try {
     const { targetInfos } = await cdp.send('Target.getTargets');
     for (const t of targetInfos.filter((x) => x.type === 'page')) {
+      if (except && t.targetId === except) continue;
       try {
         const { windowId } = await cdp.send('Browser.getWindowForTarget', { targetId: t.targetId });
         await cdp.send('Browser.setWindowBounds', { windowId, bounds: { left: -10000, top: 0 } });
       } catch {}
     }
+  } finally { cdp.close(); }
+}
+
+/**
+ * 把窗口挪回屏幕内并置于最前。只在需要用户亲自操作（登录 / 过验证码）时调用。
+ * 与 hideWindows 是一对：自动化路径用 hideWindows，人工介入路径用 showWindow。
+ */
+export async function showWindow(targetId) {
+  const cdp = await connect();
+  try {
+    const { windowId } = await cdp.send('Browser.getWindowForTarget', { targetId });
+    await cdp.send('Browser.setWindowBounds', { windowId, bounds: { left: 80, top: 60, width: 1100, height: 800, windowState: 'normal' } });
+    await cdp.send('Page.bringToFront', {}, (await cdp.send('Target.attachToTarget', { targetId, flatten: true })).sessionId);
+    return windowId;
   } finally { cdp.close(); }
 }
 
@@ -403,6 +418,15 @@ export async function evalIn(targetId, expression) {
 
 export async function navigate(targetId, url) {
   return onTab(targetId, (cdp, sessionId) => cdp.send('Page.navigate', { url }, sessionId));
+}
+
+/**
+ * 把标签页切到前台（会弹出窗口并抢一次焦点）。
+ * 只在两种场景用：① 需要用户亲自登录/点击；② 后台限速导致异步轮询卡住时的兜底。
+ * 自动化主路径不要调它 —— 那会破坏「不抢焦点」的承诺。
+ */
+export async function bringToFront(targetId) {
+  return onTab(targetId, (cdp, sessionId) => cdp.send('Page.bringToFront', {}, sessionId));
 }
 
 export async function clickSelector(targetId, selector) {
@@ -591,6 +615,8 @@ async function main() {
   new <url>                 新建后台标签页（不抢焦点），输出 targetId
   eval <target> <expr>      在标签页里求值
   nav <target> <url>        导航
+  front <target>            把标签页切到前台（会弹窗抢一次焦点，仅登录/卡住时用）
+  show <target>             把窗口挪回屏幕内并置顶（需要用户亲自登录/操作时用）
   cookies <target> <url>    列出该站点的 cookie 名（含 httpOnly）
   click <target> <selector> 点击（JS el.click()）
   clickat <target> <selector> 真鼠标点击（派发 Input 事件，React 元素必须用这个）
@@ -599,6 +625,16 @@ async function main() {
   close <target>            关闭标签页
 
 配置文件: ${CONFIG_PATH}`;
+
+  // 除「管理实例本身」的命令外，其余命令都自动拉起实例。
+  // 否则冷机状态下 `cdp.mjs new` 会直接报「实例未就绪」，破坏「零前置步骤」的承诺。
+  const MANAGES_INSTANCE = new Set(['check', 'bootstrap', 'ensure', 'sync-cookies', 'prune', 'kill']);
+  if (cmd && !MANAGES_INSTANCE.has(cmd)) {
+    await ensureBrowser({ quiet: true });
+    // show 有意让窗口可见。CDP_NO_HIDE=1 供「用户正在手动登录/操作」期间临时关掉自动隐藏，
+    // 否则后续任何一条 cdp.mjs 命令都会把用户正在填的窗口又挪到屏外。
+    if (cmd !== 'show' && process.env.CDP_NO_HIDE !== '1') await hideWindows();
+  }
 
   switch (cmd) {
     case 'check': return cmdCheck();
@@ -611,6 +647,8 @@ async function main() {
     case 'new': return log(await newTab(argv[0] || 'about:blank'));
     case 'eval': return log(String(await evalIn(argv[0], argv.slice(1).join(' ')))?.slice(0, 4000));
     case 'nav': await navigate(argv[0], argv[1]); return log('navigated');
+    case 'front': await bringToFront(argv[0]); return log('前台');
+    case 'show': return log('windowId=' + (await showWindow(argv[0])));
     case 'cookies': return log((await getCookieNames(argv[0], [argv[1]])).join(', '));
     case 'click': return log(await clickSelector(argv[0], argv[1]));
     case 'clickat': return log(await clickAtSelector(argv[0], argv[1]));

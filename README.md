@@ -60,6 +60,19 @@ node "$SKILL/scripts/cdp.mjs" bootstrap    # 一次性部署
 > 唯一无法自动化的一环：用户在**日常 Chrome** 里主动登出了这些站点。此时用
 > `node cdp.mjs new "<站点 URL>"` 在专用实例里手动登录一次，或让用户重新登录日常 Chrome。
 
+### 6. 回归测试补丁（2026-09-17 · 二次验证）
+
+拿一本真实书跑通全链路（搜索 → 下载 → 校验 → 微信读书 → Kindle 邮件）后补的四处：
+
+| 补丁 | 原因 |
+|------|------|
+| **所有业务子命令自动拉起实例** | 冷机状态下 `cdp.mjs new` 原本直接报「实例未就绪」，要用户先 `ensure` —— 破坏「零前置步骤」的承诺。现除 `check`/`bootstrap`/`ensure`/`sync-cookies`/`prune`/`kill` 外全部自动 `ensureBrowser()` |
+| **新增 `show <target>` 与 `front <target>`** | 需要用户亲自登录时，窗口得挪回屏幕内并置顶；`hideWindows` 只负责挪到屏外，缺反向操作。配合 `CDP_NO_HIDE=1` 环境变量，避免用户正在填的窗口被后续命令又挪走 |
+| **记录 `sync-cookies` / `prune` 必须先 `kill`** | 实例运行时会回写 Cookies 并锁住缓存目录，边跑边覆盖等于白做（脚本会拒绝并提示） |
+| **记录亚马逊 `/hz/mycd/*` 周期性强制重登** | 同一实例里 `sendtokindle` 显示已登录、`mycd` 却跳 `Amazon Sign-In`。**这不是 cookie 迁移失败**，重跑 `sync-cookies` 无效，需用户在专用实例里登一次 |
+
+> 结论：Z-Library 与微信读书的登录态靠 cookie 迁移就能长期稳定；**亚马逊是唯一可能需要用户偶尔登录一次**的站点——它除了轮转 `session-token`/`at-main`，还会对账号页强制重登。
+
 ---
 
 ## 更新点（2026-09-16 · 晚）：Kindle 改为邮件优先 + 引导式配置
