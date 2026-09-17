@@ -11,6 +11,57 @@ WorkBuddy Skill：从 Z-Library 下载电子书，并导入微信读书（WeRead
 
 ---
 
+## 更新点（2026-09-17）：彻底零授权、零点击——改用专用 Chrome 实例
+
+**目标**：调用 skill、说明要哪本书之后，全程静默跑完，**没有额外授权、没有额外点击**。
+
+### 1. 新增自包含浏览器层 `scripts/cdp.mjs`，彻底去掉第三方依赖
+
+原来所有浏览器交互都经 `web-access` skill 的 CDP 代理（`localhost:3456`），现在改为**自带 CDP 客户端直连**：
+
+- 不再依赖 `web-access`（技能市场安装的第三方 skill，升级时行为可能变）
+- 不再需要 `chrome://inspect/#remote-debugging` 开关
+- 不再需要 9222 端口，不再与用户的日常 Chrome 争抢
+
+### 2. 为什么必须换掉「自动点弹窗」方案
+
+连接**用户日常 Chrome** 时，Chrome 会对**每一条新建的 WebSocket 连接**弹一次「要允许远程调试吗？」，且明确拒绝持久化
+（官方在 `ChromeDevTools/chrome-devtools-mcp#825` 已 close as *not planned*）。
+
+上一版用「常驻代理 + AppleScript 每 3s 扫弹窗自动点允许」绕过，**但那要求用户给 `/usr/bin/osascript` 开辅助功能权限 ——
+本身即一次系统授权**，与「零授权」目标冲突。**该方案已废弃，相关的两个 LaunchAgent 与 `tools/` 脚本已从仓库移除。**
+
+### 3. 官方推荐路径：专用 profile 实例
+
+```bash
+node "$SKILL/scripts/cdp.mjs" bootstrap    # 一次性部署
+```
+
+- 独立 `--user-data-dir` + `--remote-debugging-port`，**结构性无弹窗**（官方原话：*In this case, there will be no dialogs.*）
+- `--no-startup-window` 启动 → **启动即零窗口**；标签页用 `background: true` 创建 → **不抢焦点**
+- 与用户的日常 Chrome 是两个独立进程，**可并存、互不干扰**
+- 登录态由**迁移 cookies** 得到，用户**不需要重新登录**任何站点
+
+### 4. 顺带修掉三个实测踩到的坑
+
+| 坑 | 处理 |
+|---|---|
+| Chrome 后台偷下端侧模型，`OptGuideOnDeviceModel` 单目录吃到 **4.0G** | 启动参数禁用；新增 `cdp.mjs prune` 清理 |
+| 微信读书传书页在后台标签被**限速卡在 ~49%** | 启动参数 `--disable-background-timer-throttling` 等关掉节流 |
+| 脚本盯的下载目录与 Chrome 实际落盘目录**可能错位** | 用 `Browser.setDownloadBehavior` 强制指定，且与脚本用同一个值 |
+
+### 5. 登录态怎么来（唯一需要理解的部分）
+
+- **时机**：只在实例未运行时同步（Chrome 退出会回写 Cookies，边跑边覆盖会互相冲掉）
+- **来源**：`~/Library/Application Support/Google/Chrome/<profile>/Cookies`
+- **为什么可行**：macOS 上 cookies 由 Keychain 的 `Chrome Safe Storage` 加密，该密钥**按应用下发而非按 profile**，换 profile 仍能解密（本机实测：Z-Library / 微信读书 / 亚马逊三站点免登录直接可用）
+- **自愈**：每次拉起实例前自动重同步。只要日常 Chrome 里还登着就不用管
+
+> 唯一无法自动化的一环：用户在**日常 Chrome** 里主动登出了这些站点。此时用
+> `node cdp.mjs new "<站点 URL>"` 在专用实例里手动登录一次，或让用户重新登录日常 Chrome。
+
+---
+
 ## 更新点（2026-09-16 · 晚）：Kindle 改为邮件优先 + 引导式配置
 
 ### 1. 投送路由硬规则
@@ -106,29 +157,32 @@ Kindle 收件地址、Agent Mail 发件地址、Z-Library 凭据统一存放在 
 
 详见下节。这是新环境最容易卡住的一关。
 
-## 环境要求（重要）
+## 环境要求
 
-本 skill 所有浏览器交互都经 `web-access` skill 的 CDP 代理（`localhost:3456`），有两条**硬要求**：
+**只需要一样东西：机器上存在任一 Chromium 系浏览器**（Chrome / Chromium / Edge / Chrome for Testing 均可）。
 
-### ① 必须是 Chromium 内核浏览器
+- **不需要**它是你的日常浏览器 —— 专用实例是独立进程、独立 profile，从不碰你的浏览数据
+- **不需要**开 `chrome://inspect/#remote-debugging` 开关
+- **不需要**任何系统权限（无需辅助功能、无需安装任何守护进程）
+- **不会**弹出「要允许远程调试吗？」
+- **不会**抢占焦点或冒出窗口（`--no-startup-window` + `background: true` 标签页）
 
-可选 `chrome` / `chrome-canary` / `chromium` / `edge`。
+**Safari 与 Firefox 不提供 CDP 端点**，无法作为目标浏览器。但这不再是障碍：随便装一个 Chromium 系即可，
+或在 `~/.workbuddy/chrome-cdp/config.local.json` 里把 `chrome_bin` 指向现成的 Chrome for Testing /
+Playwright 自带 Chromium。
 
-**Safari 与 Firefox 不支持，且不是改配置能解决的**：Safari 只提供 `safaridriver`（WebDriver 协议），Firefox 走 RDP / WebDriver BiDi，两者都不暴露 CDP 端点、不生成 `DevToolsActivePort` 文件、也不支持 `--remote-debugging-port`。本链路依赖的 `Target.createTarget` / `Page.navigate` / `Runtime.evaluate` 等均为 Chromium CDP 专有方法。
+### 三条硬约束（改 `cdp.mjs` 前必读，均为实测结论）
 
-→ 若你只用 Safari / Firefox，请先安装 Edge 或 Chrome（均免费）。
+| 约束 | 原因 |
+|------|------|
+| 必须带**非默认** `--user-data-dir` | Chrome 136+ 起 `--remote-debugging-port` 在默认 profile 上被**完全忽略**（官方反 cookie 窃取设计，无 flag/policy 可绕）。「真实默认 profile」与「可 CDP 控制」自 136 起互斥 |
+| 必须 `--no-startup-window` | 否则每次拉起都会闪一个窗口 |
+| **不能用无头模式** | `--headless=new` 会被 Z-Library 的 DiamWall 直接判成 `Access Denied` |
 
-### ② 必须手动开启远程调试
+### 配置项
 
-这是**非默认设置**，新环境几乎必然卡在这里：
-
-1. 地址栏访问 `chrome://inspect/#remote-debugging`（Edge 用 `edge://inspect/#remote-debugging`）
-2. 勾选 **"Allow remote debugging for this browser instance"**
-3. 运行 `check-deps.mjs` 确认连上
-
-> 原理：开启后浏览器才会在自己的 user-data-dir 写出 `DevToolsActivePort` 文件（首行为调试端口号），发现脚本正是读该文件定位端口。**检测不到浏览器时，先怀疑「开关没开」，而不是「没装」。**
-
-建议在 `web-access/config.env` 中固定默认浏览器（如 `WEB_ACCESS_BROWSER=chrome`），否则每次都会返回 `ambiguous` 反复询问。
+`~/.workbuddy/chrome-cdp/config.local.json`（本机私有，不入仓库）：`port`（默认 9444）、`profile_dir`、
+`chrome_bin`、`source_profile`、`download_dir`、`auto_launch`。
 
 ## 目录结构
 
@@ -136,10 +190,11 @@ Kindle 收件地址、Agent Mail 发件地址、Z-Library 凭据统一存放在 
 .
 ├── SKILL.md                        # skill 定义与完整使用说明
 └── scripts/
-    ├── zlib-cdp.mjs                # 主入口：check/setup/login/import-app/search/download
+    ├── cdp.mjs                     # 浏览器层（自包含）：实例守卫 + 直连 CDP 客户端
+    ├── zlib-cdp.mjs                # 业务主入口：check/setup/login/import-app/search/download
     ├── verify-ebook.mjs            # 电子书文件格式与完整性验证
     ├── stk-drop.mjs                # Kindle 网页投送：base64 注入 + drop
-    └── zlib-browser-dl.mjs         # 兜底下载（CDP 代理不可用时用 Playwright，会弹窗）
+    └── zlib-browser-dl.mjs         # 兜底下载（机器上完全无 Chromium 时用 Playwright，会弹窗）
 ```
 
 ## 安装（供其他 Agent 使用）
@@ -147,29 +202,32 @@ Kindle 收件地址、Agent Mail 发件地址、Z-Library 凭据统一存放在 
 ```bash
 git clone https://github.com/hohoweiyao-cmyk/book-to-remote.git \
   ~/.workbuddy/skills/book-to-remote
+
+# 一次性部署浏览器层（建 profile + 迁登录态 + 拉起实例 + 核验三站点）
+node ~/.workbuddy/skills/book-to-remote/scripts/cdp.mjs bootstrap
 ```
 
 ## 其他依赖
 
 | # | 依赖 | 说明 |
 |---|------|------|
-| 1 | `web-access` skill | 提供 CDP 代理，复用浏览器登录态（微信读书 / 亚马逊） |
-| 2 | Chromium 系浏览器 + 已开远程调试 | 见上方「环境要求」 |
-| 3 | 网络可达 z-library 镜像 | 部分地区需自备代理 |
-| 4 | Agent Mail 连接器 | 仅「Kindle 邮件投送」需要；不走邮件可跳过 |
-| 5 | Playwright + Chromium | 仅兜底下载路径需要；主路径不需要 |
+| 1 | Chromium 系浏览器 | 只要机器上存在即可，**不必是日常浏览器**；无需开任何开关 |
+| 2 | 网络可达 z-library 镜像 | 部分地区需自备代理 |
+| 3 | Agent Mail 连接器 | 仅「Kindle 邮件投送」需要；不走邮件可跳过 |
+| 4 | Playwright + Chromium | 仅兜底下载路径需要；主路径不需要 |
 
-**不再需要 Z-Library.app。**
+**不再需要 Z-Library.app，也不需要 `web-access` skill。**
 
 ## 使用
 
 ```bash
 SKILL=~/.workbuddy/skills/book-to-remote
 
-# 0) 确保 CDP 代理就绪
-node ~/.workbuddy/skills/web-access/scripts/check-deps.mjs
+# 0) 一次性部署浏览器层（之后每轮自动拉起实例 + 重同步登录态，无需再管）
+node "$SKILL/scripts/cdp.mjs" bootstrap
 
 # 1) 自检
+node "$SKILL/scripts/cdp.mjs" check
 node "$SKILL/scripts/zlib-cdp.mjs" check
 
 # 2) 取凭据（二选一，推荐 login）
@@ -201,6 +259,7 @@ node "$SKILL/scripts/verify-ebook.mjs" "$HOME/Downloads/书名.epub"
 
 - 本仓库**不硬编码任何私有账号信息**，所有邮箱均为占位符。
 - 运行时凭据与投送地址由使用者在本机自行配置，存放于 `~/.workbuddy/zlibrary/config.local.json`（skill 目录之外）。
+- 专用 Chrome 实例的配置与 profile 存放于 `~/.workbuddy/chrome-cdp/`（同样在 skill 目录之外）——**profile 内含从使用者日常浏览器迁移来的 cookies，绝不可提交或分享**。
 - 使用者的 Kindle 专属邮箱须自行在亚马逊「个人文档设置」中查看并填入。
 - 投送前请把发件地址加入亚马逊「已批准的个人文档电子邮件发送列表」，否则会被拒收。
 

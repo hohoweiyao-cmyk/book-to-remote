@@ -1,0 +1,8 @@
+# 本地私有配置（真实位置在仓库之外，这里只是兜底）
+config.local.json
+*.local.json
+config.env
+
+# 专用 Chrome profile（内含登录态 cookies）
+chrome-cdp/
+profile/

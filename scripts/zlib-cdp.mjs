@@ -7,8 +7,9 @@
  *   2. 不新开浏览器窗口、不抢焦点 —— 全程复用用户已开调试端口的 Chrome 的后台标签页；
  *   3. 只走官方权威域名（z-lib.sk 系）—— 不再使用被 Cloudflare 标记为钓鱼的 z-library.ec。
  *
- * 依赖：web-access 的 CDP 代理（localhost:3456）。
- *   node "<web-access>/scripts/check-deps.mjs"
+ * 依赖：同目录的 cdp.mjs（自包含专用 Chrome 实例）。
+ *   不需要 web-access 的 CDP 代理，不需要任何系统授权，不需要手动点授权弹窗。
+ *   首次使用跑一次：node cdp.mjs bootstrap
  *
  * 用法：
  *   node zlib-cdp.mjs check
@@ -22,6 +23,10 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import {
+  ensureBrowser, health, newTab as pnew, evalIn as peval, navigate as pnav,
+  closeTab as pclose, getDownloadDir, hideWindows,
+} from './cdp.mjs';
 
 // ---------------- 路径与常量 ----------------
 
@@ -29,7 +34,6 @@ const SKILL_DIR = path.dirname(path.dirname(new URL(import.meta.url).pathname));
 const CONFIG_DIR = path.join(homedir(), '.workbuddy', 'zlibrary');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.local.json');
 const APP_CONFIG = path.join(homedir(), 'Library/Application Support/z-library/config.json');
-const PROXY = 'http://localhost:3456';
 
 // 官方权威域名（取自 Z-Library 官方客户端下发的 domains 顺序）。
 // 刻意排除 z-library.ec：该域被 Cloudflare 标记为 "Suspected Phishing"，不作为候选。
@@ -69,31 +73,15 @@ function saveConfig(cfg) {
 
 const mask = (v) => (v ? String(v).slice(0, 4) + '****' + String(v).slice(-4) : '(未设置)');
 
-// ---------------- CDP 代理封装 ----------------
+// ---------------- 实例守卫 ----------------
 
-async function proxyOK() {
-  try {
-    const r = await fetch(PROXY + '/health', { signal: AbortSignal.timeout(4000) });
-    const j = await r.json();
-    return j?.connected ? j : null;
-  } catch { return null; }
-}
-
-async function pnew(url) {
-  const r = await fetch(PROXY + '/new', { method: 'POST', body: url });
-  return (await r.json()).targetId;
-}
-async function peval(target, expr) {
-  const r = await fetch(`${PROXY}/eval?target=${target}`, { method: 'POST', body: expr });
-  const j = await r.json();
-  if (j.error) throw new Error('eval 失败: ' + j.error);
-  return j.value;
-}
-async function pnav(target, url) {
-  await fetch(`${PROXY}/navigate?target=${target}`, { method: 'POST', body: url });
-}
-async function pclose(target) {
-  try { await fetch(`${PROXY}/close?target=${target}`); } catch {}
+/**
+ * 确保专用 Chrome 实例就绪。
+ * 没跑就同步登录态 + 拉起 + 把可能出现的窗口挪到屏幕外 —— 全程无人工介入。
+ */
+async function ensureReady() {
+  await ensureBrowser({ quiet: true });
+  await hideWindows();
 }
 
 function js(v) { return JSON.stringify(v); }
@@ -127,6 +115,7 @@ async function probeAndPickDomain(target) {
 /** 建立/复用一个已过 DiamWall 且已注入凭据的标签页 */
 async function openSession() {
   const cfg = loadConfig();
+  await ensureReady();
   const target = await pnew('about:blank');
   const domain = await probeAndPickDomain(target);
   if (!domain) { await pclose(target); throw new Error('没有可用域名：请确认浏览器能访问 z-library（可能需要代理）'); }
@@ -167,24 +156,13 @@ async function api(target, domain, p, body) {
 
 // ---------------- 下载 ----------------
 
-/** 读取用户 Chrome 的真实下载目录（逐 profile 找 download.default_directory） */
-function detectDownloadDir() {
-  const cfg = loadConfig();
-  if (cfg.download_dir && existsSync(cfg.download_dir)) return cfg.download_dir;
-  const root = path.join(homedir(), 'Library/Application Support/Google/Chrome');
-  try {
-    for (const prof of readdirSync(root)) {
-      const p = path.join(root, prof, 'Preferences');
-      if (!existsSync(p)) continue;
-      try {
-        const j = JSON.parse(readFileSync(p, 'utf8'));
-        const d = j?.download?.default_directory;
-        if (d && existsSync(d)) return d;
-      } catch {}
-    }
-  } catch {}
-  return path.join(homedir(), 'Downloads');
-}
+/**
+ * 静默下载的落盘目录。
+ * 由 cdp.mjs 统一决定（配置 > 日常 Chrome 的下载目录 > ~/Downloads），
+ * 实例那边同时用 Browser.setDownloadBehavior 强制指向同一处 ——
+ * 因此不会出现「脚本盯着 A 目录、Chrome 却存到 B 目录」的静默超时。
+ */
+function detectDownloadDir() { return getDownloadDir(); }
 
 function sanitize(name) {
   return String(name).replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 120);
@@ -267,14 +245,16 @@ function score(book, anchor) {
 async function cmdCheck() {
   log('=== Z-Library 电子书链路自检 ===\n');
 
-  // 1. CDP 代理 / Chrome
-  const health = await proxyOK();
-  if (!health) {
-    log('✗ CDP 代理未就绪');
-    log('  → 请先加载 web-access skill 并运行：node "<web-access>/scripts/check-deps.mjs"');
+  // 1. 专用 Chrome 实例（自动拉起，零弹窗零授权）
+  const h = await health();
+  if (!h) {
+    log('✗ 专用 Chrome 实例未运行');
+    log('  → 首次使用请跑：node "<skill_dir>/scripts/cdp.mjs" bootstrap');
+    log('  → 之后本脚本会自动拉起，无需手动干预');
     process.exitCode = 1;
   } else {
-    log(`✓ 浏览器 CDP: ${health.browser?.label || health.browser?.id} (端口 ${health.chromePort})，后台标签页可用`);
+    log(`✓ 专用 Chrome 实例在运行：${h.browser}（端口 ${h.port}）`);
+    log('  · 独立 profile + --remote-debugging-port，结构性无授权弹窗，无需辅助功能权限');
   }
 
   // 2. 凭据
@@ -303,7 +283,7 @@ async function cmdCheck() {
 
   // 5. 下载目录
   log(`\n下载目录: ${detectDownloadDir()}`);
-  log('  · Chrome 需关闭「下载前询问每个文件的保存位置」，否则静默下载会卡住');
+  log('  · 已由 Browser.setDownloadBehavior 强制指定，不受「下载前询问保存位置」影响');
 
   log('\n=== 自检结束 ===');
 }
@@ -338,13 +318,15 @@ async function cmdSetup(argv) {
 }
 
 async function cmdLogin() {
-  if (!(await proxyOK())) { warn('CDP 代理未就绪，请先运行 web-access 的 check-deps.mjs'); process.exit(1); }
+  await ensureReady();
   const target = await pnew('about:blank');
   const domain = (await probeAndPickDomain(target)) || 'z-lib.sk';
-  log('\n我已在你的浏览器里打开 z-library 标签页（后台，不会抢焦点）：');
+  log('\n我已在【专用 Chrome 实例】里打开 z-library 标签页（后台，不抢焦点）：');
   log(`  https://${domain}/`);
-  log('\n请切换到该标签页完成登录。登录完成后我会自动抓取凭据并保存到本机。');
-  log('（登录态只用于本机后续下载，凭据存在 ~/.workbuddy/zlibrary/config.local.json）\n');
+  log('\n注意：这是独立 profile 的窗口，不是你日常那个 Chrome。');
+  log('请切到该窗口完成登录，登录完成后我会自动抓取凭据并保存到本机。');
+  log('（凭据存在 ~/.workbuddy/zlibrary/config.local.json）\n');
+  // 这一步刻意不调 hideWindows()：窗口得留在屏幕上让用户能看见并登录。
 
   const t0 = Date.now();
   while (Date.now() - t0 < 300000) {

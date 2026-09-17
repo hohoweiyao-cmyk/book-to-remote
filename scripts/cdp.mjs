@@ -1,0 +1,628 @@
+#!/usr/bin/env node
+/**
+ * cdp.mjs — 自包含的 CDP 层（浏览器实例守卫 + 直连客户端）
+ *
+ * 为什么不用 web-access 的 CDP 代理（localhost:3456）：
+ *   那个代理会把浏览器发现限制在固定端口 9222/9229/9333，并且连用户日常 Chrome 时
+ *   每建一条 WebSocket 都要用户点「允许远程调试」授权框，无法持久化。本模块改用
+ *   Chrome 官方推荐的专用 profile 实例 —— 结构性零弹窗、零系统权限、零人工点击。
+ *
+ * 设计要点（都是实测踩出来的，别随意改）：
+ *   1. 必须带非默认 --user-data-dir。Chrome 136+ 起 --remote-debugging-port 在默认
+ *      profile 上被完全忽略，无 flag/policy 可绕（官方反 cookie 窃取设计）。
+ *   2. 必须 --no-startup-window。启动时不创建任何窗口 → 用户完全无感。
+ *   3. 不能无头（--headless=new）。Z-Library 的 DiamWall 会直接回 Access Denied。
+ *   4. 标签页用 Target.createTarget + background:true 创建，不抢焦点。
+ *   5. 下载目录用 Browser.setDownloadBehavior 强制指定，不依赖 profile 的 Preferences，
+ *      顺带免疫「下载前询问保存位置」这个经典卡点。
+ *
+ * 用法：
+ *   node cdp.mjs check                    环境自检
+ *   node cdp.mjs bootstrap                首次部署：建 profile + 迁登录态 + 拉起实例
+ *   node cdp.mjs ensure                   确保实例就绪（没跑就自动拉起）
+ *   node cdp.mjs tabs                     列出标签页
+ *   node cdp.mjs new <url>                新建后台标签页，输出 targetId
+ *   node cdp.mjs eval <target> <expr>     在标签页里求值（支持 await）
+ *   node cdp.mjs nav <target> <url>       导航
+ *   node cdp.mjs click <target> <selector>
+ *   node cdp.mjs setfiles <target> <selector> <文件路径...>
+ *   node cdp.mjs close <target>           关闭标签页
+ *   node cdp.mjs sync-cookies             从日常 Chrome 重新同步登录态
+ *   node cdp.mjs kill                     停止专用实例（会连带收走所有标签页）
+ */
+
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, statSync, readdirSync, chmodSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+const HOME = homedir();
+const CONFIG_DIR = path.join(HOME, '.workbuddy', 'chrome-cdp');
+const CONFIG_PATH = path.join(CONFIG_DIR, 'config.local.json');
+
+const DEFAULTS = {
+  _comment: '专用 Chrome 实例的本地配置。位于 skill 仓库之外，请勿提交到任何仓库。',
+  port: 9444,
+  profile_dir: path.join(HOME, '.workbuddy', 'chrome-cdp', 'profile'),
+  chrome_bin: '',
+  source_root: '',
+  source_profile: 'Default',
+  download_dir: '',
+  auto_launch: true,
+};
+
+// 刻意不 return：process.stdout.write 返回布尔值，透传出去会被赋给 process.exitCode 而报警
+export const log = (m) => { process.stdout.write(m + '\n'); };
+export const warn = (m) => { process.stderr.write('[warn] ' + m + '\n'); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------------- 配置 ----------------
+
+export function loadConfig() {
+  if (!existsSync(CONFIG_PATH)) return { ...DEFAULTS };
+  try {
+    return { ...DEFAULTS, ...JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) };
+  } catch (e) {
+    warn('CDP 配置损坏，改用默认值：' + e.message);
+    return { ...DEFAULTS };
+  }
+}
+
+export function saveConfig(cfg) {
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  const { _comment, ...rest } = { ...DEFAULTS, ...cfg };
+  writeFileSync(CONFIG_PATH, JSON.stringify({ _comment, ...rest }, null, 2) + '\n', { mode: 0o600 });
+  try { chmodSync(CONFIG_PATH, 0o600); } catch {}
+}
+
+// ---------------- Chrome 与 profile 定位 ----------------
+
+const CHROME_CANDIDATES = [
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  path.join(HOME, 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+];
+
+export function findChrome() {
+  const cfg = loadConfig();
+  if (cfg.chrome_bin && existsSync(cfg.chrome_bin)) return cfg.chrome_bin;
+  for (const p of CHROME_CANDIDATES) if (existsSync(p)) return p;
+  return null;
+}
+
+/** 用户日常 Chrome 的 user-data-dir 根目录 */
+export function findSourceRoot() {
+  const cfg = loadConfig();
+  if (cfg.source_root && existsSync(cfg.source_root)) return cfg.source_root;
+  const cands = [
+    path.join(HOME, 'Library/Application Support/Google/Chrome'),
+    path.join(HOME, 'Library/Application Support/Chromium'),
+    path.join(HOME, 'Library/Application Support/Microsoft Edge'),
+  ];
+  for (const p of cands) if (existsSync(p)) return p;
+  return null;
+}
+
+/**
+ * 从日常 Chrome 迁移登录态。
+ * 只在专用实例【没在跑】时执行：Chrome 退出时会回写 Cookies，边跑边覆盖会互相冲掉。
+ * 迁移的是 Cookies 数据库 —— macOS 上它由 Keychain 的 "Chrome Safe Storage" 加密，
+ * 该密钥按应用（而非按 profile）下发，所以同机同应用换个 profile 仍能解密。
+ */
+export function syncCookies({ verbose = true } = {}) {
+  const cfg = loadConfig();
+  const root = findSourceRoot();
+  if (!root) { warn('找不到日常 Chrome 的数据目录，跳过登录态同步'); return false; }
+
+  // 选源 profile：显式配置优先；否则取 Default，没有就取 Cookie 库最大的那个
+  let srcName = cfg.source_profile;
+  if (!existsSync(path.join(root, srcName, 'Cookies'))) {
+    const cands = readdirSync(root).filter((d) => existsSync(path.join(root, d, 'Cookies')));
+    if (!cands.length) { warn(`源 profile 里没有 Cookies 数据库：${root}`); return false; }
+    srcName = cands
+      .map((d) => ({ d, size: statSync(path.join(root, d, 'Cookies')).size }))
+      .sort((a, b) => b.size - a.size)[0].d;
+  }
+  const srcDir = path.join(root, srcName);
+  const dstDir = path.join(cfg.profile_dir, 'Default');
+  mkdirSync(path.join(dstDir, 'Network'), { recursive: true });
+
+  let n = 0;
+  for (const f of ['Cookies', 'Cookies-journal', 'Local State']) {
+    const s = path.join(srcDir, f);
+    if (!existsSync(s)) continue;
+    copyFileSync(s, path.join(dstDir, f));
+    n++;
+  }
+  // Local Storage 只在首次部署时整体搬一次（可能上百 MB，不适合每次都同步）
+  const srcLS = path.join(srcDir, 'Local Storage');
+  const dstLS = path.join(dstDir, 'Local Storage');
+  if (existsSync(srcLS) && !existsSync(dstLS)) {
+    mkdirSync(path.dirname(dstLS), { recursive: true });
+    cpR(srcLS, dstLS);
+    n++;
+  }
+  if (verbose && n) log(`✓ 已从日常 Chrome 的「${srcName}」迁移 ${n} 项登录态`);
+  else if (verbose) warn('源目录里没有可迁移的登录态文件');
+  return n > 0;
+}
+
+function cpR(src, dst) {
+  mkdirSync(dst, { recursive: true });
+  for (const e of readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, e.name), d = path.join(dst, e.name);
+    if (e.isDirectory()) cpR(s, d);
+    else if (e.isFile()) { try { copyFileSync(s, d); } catch {} }
+  }
+}
+
+/** 静默下载的落盘目录：配置 > 日常 Chrome 的下载目录 > ~/Downloads */
+export function getDownloadDir() {
+  const cfg = loadConfig();
+  if (cfg.download_dir && existsSync(cfg.download_dir)) return cfg.download_dir;
+  const root = findSourceRoot();
+  if (root) {
+    for (const prof of ['Default', ...readdirSync(root).filter((d) => /^Profile /.test(d))]) {
+      const p = path.join(root, prof, 'Preferences');
+      if (!existsSync(p)) continue;
+      try {
+        const d = JSON.parse(readFileSync(p, 'utf8'))?.download?.default_directory;
+        if (d && existsSync(d)) return d;
+      } catch {}
+    }
+  }
+  return path.join(HOME, 'Downloads');
+}
+
+// ---------------- 实例守卫 ----------------
+
+/** 实例是否活着（node fetch 不读 HTTP_PROXY，所以不受环境代理劫持影响） */
+export async function health() {
+  const cfg = loadConfig();
+  try {
+    const r = await fetch(`http://127.0.0.1:${cfg.port}/json/version`, {
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j?.webSocketDebuggerUrl) return null;
+    return { connected: true, port: cfg.port, browser: j.Browser, wsUrl: j.webSocketDebuggerUrl };
+  } catch { return null; }
+}
+
+export async function isUp() { return !!(await health()); }
+
+function launch() {
+  const cfg = loadConfig();
+  const bin = findChrome();
+  if (!bin) throw new Error('找不到 Chrome/Chromium，请在配置里指定 chrome_bin：' + CONFIG_PATH);
+  if (!existsSync(cfg.profile_dir)) mkdirSync(cfg.profile_dir, { recursive: true });
+  const args = [
+    `--user-data-dir=${cfg.profile_dir}`,
+    `--remote-debugging-port=${cfg.port}`,
+    '--no-startup-window',       // 启动不建窗口：用户完全无感
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-sync',
+    '--restore-last-session=false',
+    // 关掉后台标签节流：微信读书传书页在后台标签会被限速卡在 ~49%，
+    // 关掉节流后后台标签也能全速跑完，不需要把标签切前台。
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-ipc-flooding-protection',
+    // 关掉端侧模型下载：实测 OptGuideOnDeviceModel 单个目录能吃到 4.0G
+    '--disable-features=OptimizationGuideOnDeviceModel,OptimizationGuideModelDownloading,Translate,MediaRouter,GlobalMediaControls',
+  ];
+  const p = spawn(bin, args, { detached: true, stdio: 'ignore' });
+  p.unref();
+}
+
+/** profile 里只可再生的胖目录（专有 profile，删了 Chrome 会自己重建，不影响登录态） */
+const PRUNABLE = ['OptGuideOnDeviceModel', 'optimization_guide_model_store', 'Default/Cache', 'Default/Code Cache', 'BrowserMetrics'];
+
+/**
+ * 清理可再生缓存。必须在实例停止时做。
+ * 不删 Default/Cookies、Local Storage、Preferences —— 那些是登录态。
+ */
+export function pruneProfile({ verbose = true } = {}) {
+  const cfg = loadConfig();
+  const freed = [];
+  for (const rel of PRUNABLE) {
+    const p = path.join(cfg.profile_dir, rel);
+    if (!existsSync(p)) continue;
+    let size = 0;
+    try { size = dirSize(p); } catch {}
+    if (size < 50 * 1024 * 1024) continue;      // 小于 50MB 不值得动
+    try {
+      rmR(p);
+      freed.push(`${rel} (${(size / 1073741824).toFixed(2)}GB)`);
+    } catch {}
+  }
+  if (verbose && freed.length) log('✓ 已清理可再生缓存：' + freed.join('、'));
+  return freed;
+}
+
+function dirSize(p) {
+  const st = statSync(p);
+  if (!st.isDirectory()) return st.size;
+  let n = 0;
+  for (const e of readdirSync(p, { withFileTypes: true })) {
+    try { n += dirSize(path.join(p, e.name)); } catch {}
+  }
+  return n;
+}
+
+function rmR(p) {
+  rmSync(p, { recursive: true, force: true });
+}
+
+/**
+ * 确保专用实例就绪。返回 true 表示本次是新拉起的。
+ * 拉起前会同步登录态（只在实例未运行时做，避免互相覆盖）。
+ */
+export async function ensureBrowser({ quiet = false } = {}) {
+  const cfg = loadConfig();
+  if (await isUp()) return false;
+  if (!cfg.auto_launch) throw new Error(`专用实例未运行，且 auto_launch=false。请手动启动后重试（端口 ${cfg.port}）`);
+
+  syncCookies({ verbose: !quiet });
+  pruneProfile({ verbose: !quiet });
+  launch();
+  const t0 = Date.now();
+  while (Date.now() - t0 < 30000) {
+    await sleep(700);
+    if (await isUp()) {
+      if (!quiet) log(`✓ 专用实例已就绪（端口 ${cfg.port}）`);
+      await applyDownloadBehavior();
+      return true;
+    }
+  }
+  throw new Error(
+    `拉起专用实例超时（30s，端口 ${cfg.port}）。排查：\n` +
+    `  · 手动执行看报错："${findChrome()}" --user-data-dir="${cfg.profile_dir}" --remote-debugging-port=${cfg.port}\n` +
+    `  · 端口被占：lsof -nP -iTCP:${cfg.port} -sTCP:LISTEN`
+  );
+}
+
+/** 强制下载落盘目录，绕开 profile Preferences 与「下载前询问保存位置」 */
+export async function applyDownloadBehavior(dir) {
+  const target = dir || getDownloadDir();
+  const cdp = await connect();
+  try {
+    await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: target });
+    return target;
+  } finally { cdp.close(); }
+}
+
+/** 兜底：把可能出现的窗口挪到屏幕外（窗口最小化 CDP 无效，只能挪） */
+export async function hideWindows() {
+  const cdp = await connect();
+  try {
+    const { targetInfos } = await cdp.send('Target.getTargets');
+    for (const t of targetInfos.filter((x) => x.type === 'page')) {
+      try {
+        const { windowId } = await cdp.send('Browser.getWindowForTarget', { targetId: t.targetId });
+        await cdp.send('Browser.setWindowBounds', { windowId, bounds: { left: -10000, top: 0 } });
+      } catch {}
+    }
+  } finally { cdp.close(); }
+}
+
+// ---------------- CDP 客户端 ----------------
+
+/** 建立到浏览器的 WebSocket，返回 { send, close } */
+export async function connect() {
+  const h = await health();
+  if (!h) throw new Error('专用实例未就绪，请先调用 ensureBrowser() 或运行 `node cdp.mjs ensure`');
+  const ws = new WebSocket(h.wsUrl);
+  let id = 0;
+  const pending = new Map();
+
+  ws.addEventListener('message', (ev) => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch { return; }
+    if (d.id && pending.has(d.id)) {
+      const { res, rej } = pending.get(d.id);
+      pending.delete(d.id);
+      d.error ? rej(new Error(d.error.message || JSON.stringify(d.error))) : res(d.result);
+    }
+  });
+
+  await new Promise((res, rej) => {
+    ws.addEventListener('open', res, { once: true });
+    ws.addEventListener('error', () => rej(new Error('CDP WebSocket 连接失败')), { once: true });
+    setTimeout(() => rej(new Error('CDP WebSocket 握手超时')), 10000);
+  });
+
+  return {
+    send: (method, params = {}, sessionId) =>
+      new Promise((res, rej) => {
+        const i = ++id;
+        pending.set(i, { res, rej });
+        ws.send(JSON.stringify({ id: i, method, params, ...(sessionId ? { sessionId } : {}) }));
+      }),
+    close: () => { try { ws.close(); } catch {} },
+  };
+}
+
+/** 在指定标签页上开一个 session，用完即弃（不污染浏览器级连接） */
+async function onTab(targetId, fn) {
+  const cdp = await connect();
+  try {
+    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    return await fn(cdp, sessionId);
+  } finally { cdp.close(); }
+}
+
+/**
+ * 暴露给需要在一个标签页上连续发多条命令的场景（例如分块注入大文件）。
+ * fn(cdp, sessionId)：cdp.send(method, params, sessionId)
+ */
+export async function withTab(targetId, fn) { return onTab(targetId, fn); }
+
+export async function newTab(url = 'about:blank') {
+  const cdp = await connect();
+  try {
+    // background:true → 不抢焦点
+    const { targetId } = await cdp.send('Target.createTarget', { url, background: true });
+    return targetId;
+  } finally { cdp.close(); }
+}
+
+export async function closeTab(targetId) {
+  const cdp = await connect();
+  try { await cdp.send('Target.closeTarget', { targetId }); }
+  catch {}
+  finally { cdp.close(); }
+}
+
+export async function listTabs() {
+  const cdp = await connect();
+  try {
+    const { targetInfos } = await cdp.send('Target.getTargets');
+    return targetInfos.filter((t) => t.type === 'page').map((t) => ({ id: t.targetId, url: t.url, title: t.title }));
+  } finally { cdp.close(); }
+}
+
+/** 在标签页里求值。awaitPromise 必须开 —— eapi 调用是 async IIFE */
+export async function evalIn(targetId, expression) {
+  return onTab(targetId, async (cdp, sessionId) => {
+    const r = await cdp.send('Runtime.evaluate', {
+      expression, returnByValue: true, awaitPromise: true,
+    }, sessionId);
+    if (r.exceptionDetails) {
+      throw new Error('页面内求值异常: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text));
+    }
+    return r.result?.value;
+  });
+}
+
+export async function navigate(targetId, url) {
+  return onTab(targetId, (cdp, sessionId) => cdp.send('Page.navigate', { url }, sessionId));
+}
+
+export async function clickSelector(targetId, selector) {
+  return onTab(targetId, (cdp, sessionId) =>
+    cdp.send('Runtime.evaluate', {
+      expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return 'not-found'; el.click(); return 'clicked'; })()`,
+      returnByValue: true, awaitPromise: true,
+    }, sessionId).then((r) => r.result?.value));
+}
+
+/** 往 <input type=file> 塞文件（微信读书传书页没有可点的上传按钮，只能走这条） */
+export async function setFiles(targetId, selector, files) {
+  return onTab(targetId, async (cdp, sessionId) => {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1 }, sessionId);
+    const { nodeId } = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector }, sessionId);
+    if (!nodeId) throw new Error(`找不到文件输入框：${selector}`);
+    await cdp.send('DOM.setFileInputFiles', { nodeId, files }, sessionId);
+    return files.length;
+  });
+}
+
+/**
+ * 真鼠标点击（派发 Input 事件序列，不是 el.click()）。
+ * 亚马逊 Kindle 的「Deliver to device」是 React 的 div.action_button，
+ * el.click() 完全点不动，必须走真实的鼠标事件。
+ */
+export async function clickAtSelector(targetId, selector) {
+  return onTab(targetId, async (cdp, sessionId) => {
+    const ev = (expr) => cdp.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }, sessionId);
+    const r = await ev(`(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const b = el.getBoundingClientRect();
+      return JSON.stringify({ x: b.left + b.width / 2, y: b.top + b.height / 2 });
+    })()`);
+    if (!r.result?.value) return 'not-found';
+    const { x, y } = JSON.parse(r.result.value);
+    const p = { x: Math.round(x), y: Math.round(y), button: 'left', clickCount: 1, pointerType: 'mouse' };
+    // 先 mouseMoved：部分 React 监听器只认带移动的完整序列
+    await cdp.send('Input.dispatchMouseEvent', { ...p, type: 'mouseMoved', buttons: 0 }, sessionId);
+    await cdp.send('Input.dispatchMouseEvent', { ...p, type: 'mousePressed', buttons: 1 }, sessionId);
+    await cdp.send('Input.dispatchMouseEvent', { ...p, type: 'mouseReleased', buttons: 0 }, sessionId);
+    return `clicked ${p.x},${p.y}`;
+  });
+}
+
+/** 截图到本地文件。页面状态拿不准时先看真实画面，比反复查 DOM 快 */
+export async function screenshot(targetId, outPath) {
+  return onTab(targetId, async (cdp, sessionId) => {
+    const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sessionId);
+    writeFileSync(outPath, Buffer.from(data, 'base64'));
+    return outPath;
+  });
+}
+
+/** 读 cookie 名（走 Network.getCookies，能看到 httpOnly —— document.cookie 看不到） */
+export async function getCookieNames(targetId, urls) {
+  return onTab(targetId, async (cdp, sessionId) => {
+    await cdp.send('Network.enable', {}, sessionId);
+    const { cookies } = await cdp.send('Network.getCookies', { urls }, sessionId);
+    return cookies.map((c) => c.name);
+  });
+}
+
+/** 轮询等待条件成立，返回求值结果；超时抛错 */
+export async function waitFor(targetId, expression, { timeout = 60000, interval = 1500, label = '条件' } = {}) {
+  const t0 = Date.now();
+  let last;
+  while (Date.now() - t0 < timeout) {
+    try { last = await evalIn(targetId, expression); } catch (e) { last = 'eval-error: ' + e.message; }
+    if (last) return last;
+    await sleep(interval);
+  }
+  throw new Error(`等待「${label}」超时（${timeout}ms），最后取值：${String(last).slice(0, 200)}`);
+}
+
+// ---------------- CLI ----------------
+
+async function cmdCheck() {
+  const cfg = loadConfig();
+  const bin = findChrome();
+  const root = findSourceRoot();
+  log('=== 专用 Chrome 实例自检 ===\n');
+  log(`配置文件    : ${CONFIG_PATH} ${existsSync(CONFIG_PATH) ? '' : '（未创建，用默认值）'}`);
+  log(`Chrome 可执行: ${bin || '✗ 未找到'}`);
+  log(`专用 profile : ${cfg.profile_dir} ${existsSync(cfg.profile_dir) ? '✓ 已存在' : '(未创建，bootstrap 会建)'}`);
+  log(`调试端口     : ${cfg.port}`);
+  log(`下载目录     : ${getDownloadDir()}`);
+  log(`登录态来源   : ${root ? root + ' / ' + cfg.source_profile : '✗ 未找到日常 Chrome 数据目录'}`);
+
+  const h = await health();
+  if (h) log(`\n✓ 实例在运行：${h.browser}（端口 ${h.port}），WS 通道可用，无需任何授权`);
+  else log(`\n· 实例未运行 —— 首次使用请跑 \`node cdp.mjs bootstrap\`，之后会自动拉起`);
+  return 0;
+}
+
+async function cmdBootstrap() {
+  log('=== 首次部署专用 Chrome 实例 ===\n');
+  const cfg = loadConfig();
+  if (!existsSync(cfg.profile_dir)) mkdirSync(cfg.profile_dir, { recursive: true });
+
+  if (await isUp()) { await hideWindows(); log('· 实例已在运行，跳过拉起'); }
+  else await ensureBrowser();     // 内部会同步登录态 + 清理缓存 + 拉起
+  await applyDownloadBehavior();
+
+  log('\n--- 登录态核验 ---');
+  const checks = [
+    ['Z-Library', 'https://z-lib.sk/', 'remix_userid', 'https://z-lib.sk'],
+    ['微信读书', 'https://weread.qq.com/web/shelf', 'wr_vid', 'https://weread.qq.com'],
+    ['亚马逊', 'https://www.amazon.com/', 'session-id', 'https://www.amazon.com'],
+  ];
+  let bad = 0;
+  for (const [label, url, cookieName, cookieUrl] of checks) {
+    const t = await newTab(url);
+    try {
+      await sleep(6000);
+      const names = await getCookieNames(t, [cookieUrl]);
+      const ok = names.includes(cookieName);
+      log(`  ${ok ? '✓' : '✗'} ${label}`);
+      if (!ok) {
+        bad++;
+        log(`      → 缺 ${cookieName}。先在专用实例里登录一次：`);
+        log(`        node cdp.mjs new "${url}"   然后切到该窗口用鼠标登录`);
+      }
+    } catch (e) {
+      bad++;
+      log(`  ✗ ${label}（${e.message.slice(0, 60)}）`);
+    } finally { await closeTab(t); }
+  }
+  await hideWindows();
+  log(bad ? `\n完成，但有 ${bad} 个站点需要手动登录一次。` : '\n全部就绪。之后全流程无需任何人工介入。');
+  return bad ? 1 : 0;
+}
+
+async function cmdEnsure() {
+  const launched = await ensureBrowser();
+  if (!launched) log('· 实例已在运行');
+  await applyDownloadBehavior();
+  await hideWindows();
+  return 0;
+}
+
+async function cmdSyncCookies() {
+  if (await isUp()) {
+    warn('专用实例正在运行 —— 此时覆盖 Cookies 会被它退出时回写冲掉，已中止。');
+    warn('先 `node cdp.mjs kill`，再重跑本命令。');
+    return 1;
+  }
+  return syncCookies({ verbose: true }) ? 0 : 1;
+}
+
+async function cmdKill() {
+  const cfg = loadConfig();
+  const cdp = await connect().catch(() => null);
+  if (cdp) {
+    try { await cdp.send('Browser.close'); } catch {}
+    cdp.close();
+  }
+  await sleep(1500);
+  log(await isUp() ? '· 实例仍在运行（可能有其它窗口），可手动退出' : '✓ 专用实例已停止');
+  return 0;
+}
+
+async function cmdPrune() {
+  if (await isUp()) {
+    warn('实例正在运行，先 `node cdp.mjs kill` 再清理。');
+    return 1;
+  }
+  const freed = pruneProfile({ verbose: true });
+  log(freed.length ? '完成' : '无需清理');
+  return 0;
+}
+
+async function main() {
+  const [cmd, ...argv] = process.argv.slice(2);
+  const usage = `用法: node cdp.mjs <命令>
+
+  check                     环境自检（Chrome / profile / 端口 / 登录态来源）
+  bootstrap                 首次部署：建 profile + 迁登录态 + 拉起实例 + 核验三站点
+  ensure                    确保实例就绪（没跑就自动拉起）
+  sync-cookies              从日常 Chrome 重新同步登录态（实例须已停止）
+  prune                     清理 profile 里的可再生缓存（实例须已停止）
+  kill                      停止专用实例
+  tabs                      列出标签页
+  new <url>                 新建后台标签页（不抢焦点），输出 targetId
+  eval <target> <expr>      在标签页里求值
+  nav <target> <url>        导航
+  cookies <target> <url>    列出该站点的 cookie 名（含 httpOnly）
+  click <target> <selector> 点击（JS el.click()）
+  clickat <target> <selector> 真鼠标点击（派发 Input 事件，React 元素必须用这个）
+  shot <target> <输出路径>  截图
+  setfiles <target> <selector> <文件...>
+  close <target>            关闭标签页
+
+配置文件: ${CONFIG_PATH}`;
+
+  switch (cmd) {
+    case 'check': return cmdCheck();
+    case 'bootstrap': return cmdBootstrap();
+    case 'ensure': return cmdEnsure();
+    case 'sync-cookies': return cmdSyncCookies();
+    case 'prune': return cmdPrune();
+    case 'kill': return cmdKill();
+    case 'tabs': return log((await listTabs()).map((t) => `${t.id}\t${t.title}\t${t.url}`).join('\n'));
+    case 'new': return log(await newTab(argv[0] || 'about:blank'));
+    case 'eval': return log(String(await evalIn(argv[0], argv.slice(1).join(' ')))?.slice(0, 4000));
+    case 'nav': await navigate(argv[0], argv[1]); return log('navigated');
+    case 'cookies': return log((await getCookieNames(argv[0], [argv[1]])).join(', '));
+    case 'click': return log(await clickSelector(argv[0], argv[1]));
+    case 'clickat': return log(await clickAtSelector(argv[0], argv[1]));
+    case 'shot': return log(await screenshot(argv[0], argv[1]));
+    case 'setfiles': return log(await setFiles(argv[0], argv[1], argv.slice(2)) + ' file(s)');
+    case 'close': return closeTab(argv[0]);
+    default: log(usage); process.exit(cmd ? 2 : 0);
+  }
+}
+
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  try { process.exitCode = (await main()) ?? 0; }
+  catch (e) { warn(e.message); process.exitCode = 1; }
+}
