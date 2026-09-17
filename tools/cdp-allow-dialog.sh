@@ -138,9 +138,18 @@ do_install() {
 </plist>
 EOF
   launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>&1 | head -3
+  local out
+  out="$(launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>&1)"
+  if [ -n "$out" ]; then
+    # 常见：Bootstrap failed: 5: Input/output error —— 不在 Aqua 会话里
+    echo "plist 已写入，但加载失败：$out"
+    echo "→ 若含 'Bootstrap failed: 5'，说明当前不在 Aqua 登录会话（比如从脚本沙箱调用）。"
+    echo "  请在真实 Terminal 里重跑，或直接跑： bash $SELF_DIR/cdp-setup.sh"
+    echo "Plist: $PLIST"
+    return 1
+  fi
   launchctl enable "gui/$(id -u)/${LABEL}" >/dev/null 2>&1 || true
-  echo "已安装并启动: $LABEL（每 ${INTERVAL}s 扫一次）"
+  echo "已加载并启动: $LABEL（每 ${INTERVAL}s 扫一次）"
   echo "Plist: $PLIST"
 }
 
