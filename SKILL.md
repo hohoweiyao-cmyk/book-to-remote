@@ -28,7 +28,7 @@ agent_created: true
 
 ## 浏览器前置条件（换新环境前必查）
 
-本 skill 所有浏览器交互都经 `web-access` 的 CDP 代理（`localhost:3456`），因此有两条**硬要求**：
+本 skill 所有浏览器交互都经 `web-access` 的 CDP 代理（`localhost:3456`），因此有三条**硬要求**：
 
 **① 必须是 Chromium 内核浏览器。** `web-access/scripts/browser-discovery.mjs` 的白名单是硬编码的：
 
@@ -51,6 +51,55 @@ agent_created: true
 > **本机已固定偏好**：`web-access/config.env` 中 `WEB_ACCESS_BROWSER=chrome`，因此 `check-deps.mjs` 现在直接返回 `browser: ok (Chrome, port 9222) [config.env 偏好]`，不再每次询问。**给其他使用者部署时也建议首次就固定**——该文件是 git ignored 的本机配置，不会进仓库。想换浏览器改这一行即可（切换后须 `pkill -f cdp-proxy.mjs` 再重跑，因为 proxy 是长驻进程）。
 >
 > ⚠️ **注意**：`web-access` 是从技能市场安装的第三方 skill（非本 skill 自建），其 `SKILL.md` 里也补了同样的「环境要求」章节，但**市场版本升级时那份说明可能被覆盖**（`config.env` 是本机配置文件，一般不受影响）。因此本节是**自包含的完整副本**，两者冲突时以本节为准。
+
+**③ 会弹「要允许远程调试吗？」授权框，按「每条新建连接」弹一次，且无法关闭。**
+
+这两个东西极容易混为一谈，务必分清：
+
+| | 开关 / 弹窗 | 作用域 | 能否持久化 |
+|---|---|---|---|
+| 开端口 | `chrome://inspect/#remote-debugging` 的勾选框 | 整个浏览器实例 | ✅ 已写入 `Local State` → `devtools.remote_debugging.user-enabled` |
+| **放行谁连** | **「要允许远程调试吗？」弹窗** | **每一条新建 WebSocket 连接** | ❌ Chrome 明确拒绝 |
+
+Chrome 官方在 `ChromeDevTools/chrome-devtools-mcp#825` 里给的结论（已 close as *not planned*）：
+
+> There is no simple solution that also would not allow any program on the machine to easily access your data in Chrome.
+> For now, we recommend to **have longer connection sessions** to avoid the reconnect dialog.
+
+理由：一旦能持久化，本机任意程序都能静默读走你的 Cookie 与密码库。官方给的两条出路是「**保持长连接**」和「**专用 profile + `--remote-debugging-port` 启动**（结构上永不弹窗，代价是没有你的登录态）」。
+
+**卡在这里的三个特征**（任一命中就是没授权，不要往别处查）：
+
+| 现象 | 含义 |
+|------|------|
+| `curl 127.0.0.1:9222/json/version` 返回 **404 空 body** | 未批准前 Chrome 不提供 HTTP 端点 |
+| 代理 `/health` 显示 `connected: null`、`chromePort: null` | 连接未建立 |
+| 代理 `/targets`、`/eval` **超时** | TCP 已 ESTABLISHED，但 WS 握手被挂起等授权 |
+
+> 历史坑（已在 `web-access/scripts/cdp-proxy.mjs` 修掉）：原 `connect()` 只监听 `open`/`error`/`close`，Chrome 挂起握手时三者都不触发，导致 `connectingPromise` **永不 settle**，代理静默假死且没有任何报错。现已加 `HANDSHAKE_TIMEOUT_MS`（默认 20s，可用环境变量覆盖），超时后明确报「Chrome 正在等待授权」。
+> ⚠️ `web-access` 是市场安装的第三方 skill，这处改动在它升级时**可能被覆盖**；届时重新打补丁即可。
+
+### 授权弹窗自动化（2026-09-17 新增，本机已配）
+
+为解决「每轮任务都要手点允许」，本机装了两个常驻守护（脚本在 `~/.workbuddy/tools/`，刻意放在 skill 目录外，避免被市场升级覆盖）：
+
+| 组件 | 作用 |
+|------|------|
+| `cdp-proxy-daemon.sh` + `com.damon.cdp-proxy.plist` | CDP 代理常驻（官方建议的 long session）。`KeepAlive`，崩了自动拉起，开机自启 |
+| `cdp-allow-dialog.applescript` + `cdp-allow-dialog.sh` + `com.damon.cdp-allow-dialog.plist` | 每 3s 扫一次 Chrome 的授权弹窗，命中就自动点「允许」 |
+| `cdp-setup.sh` | 一键安装 / 卸载 / 自检 |
+
+```bash
+bash ~/.workbuddy/tools/cdp-setup.sh            # 安装 + 自检
+bash ~/.workbuddy/tools/cdp-setup.sh --status    # 只看状态
+bash ~/.workbuddy/tools/cdp-setup.sh --remove    # 卸载
+```
+
+三个设计要点（踩过才总结出来的，改脚本前先读）：
+
+1. **必须在真实 Terminal 里装。** `launchctl bootstrap gui/<uid>` 要求调用方处于 Aqua 登录会话；从 AI 助手的脚本沙箱里调用会稳定报 `Bootstrap failed: 5: Input/output error`——连 `/bin/date` 这种最小 agent 也一样，不是 plist 写错了。
+2. **弹窗守护的入口必须是 `/usr/bin/osascript`，不能包一层 bash。** macOS 的辅助功能（TCC）授权按「主可执行文件」判定：用 `/bin/bash` 做入口就得把 `/bin/bash` 加进辅助功能，等于任何脚本都能驱动 UI，授权面太宽。所以该 plist 用 `StartInterval` 定时轮询（而非 `KeepAlive` 常驻循环），让入口保持 osascript，用户只需授权这一个系统脚本。
+3. **安全守卫是三层**：只扫特定浏览器进程 → 容器必须是 dialog/sheet/alert/modal 角色 → 弹窗文本必须命中远程调试类关键词。任一不满足都不点。AppleScript 只在**真的点击**时才写日志，所以定时轮询不会刷爆日志文件。
 
 ### 如果用户机器上只有 Safari / Firefox
 
@@ -349,6 +398,10 @@ node "<skill_dir>/scripts/verify-ebook.mjs" <文件路径>
 | Node/curl 访问镜像根路径返回 `307 Temporary Redirect` + `DiamWall` | 反爬墙，Node 破不了；必须走浏览器（`zlib-cdp.mjs` 已内置） |
 | 无头浏览器下载拿到 `Try again later` | 无头必被识别，不要用 headless；用后台标签页方案 |
 | 直连 `ws://127.0.0.1:9222/devtools/browser` 超时 | 沙箱会拦裸 WS；改走 CDP 代理 `localhost:3456` |
+| 开关明明已勾选，还是连不上 | 是**按连接生效的授权弹窗**没点，不是开关问题。特征：`9222/json/version` 返 404 空 body、代理 `/targets` 超时、`/health` 报 `connected: null`。跑 `bash ~/.workbuddy/tools/cdp-setup.sh --status` 定位 |
+| 每个任务都要手点一次「允许」 | 代理被反复重启，每条新连接都要重新批准。现已是常驻守护 + 弹窗自动点击；若仍频繁出现，先看代理有没有在反复崩（`~/Library/Logs/cdp-proxy.err.log`） |
+| 装守护时报 `Bootstrap failed: 5: Input/output error` | `launchctl bootstrap` 要求处于 Aqua 登录会话。**必须在真实 Terminal 里**跑 `~/.workbuddy/tools/cdp-setup.sh`；从 AI 助手的脚本沙箱里调用一定失败（连 `/bin/date` 最小 agent 也一样） |
+| 弹窗守护装了但没点 | 辅助功能权限没给。给 `/usr/bin/osascript` 授权即可（**不需要**给 `/bin/bash`，入口刻意设成 osascript 就是为收窄授权面）。改完 `launchctl kickstart -k gui/$(id -u)/com.damon.cdp-allow-dialog` |
 | 域名页显示 `Suspected Phishing` | 该域被 Cloudflare 标记，**不要用**（如 `z-library.ec`）；脚本已剔除，只在候选表里手动加回过才可能遇到 |
 | 下载 90s 超时且目录无新文件 | 大概率 Chrome 开了「下载前询问保存位置」，去 `chrome://settings/downloads` 关掉 |
 | 下载目录不是 `~/Downloads` | 脚本会自动读 Chrome `Preferences.download.default_directory`；也可 `setup --download-dir` 指定 |
