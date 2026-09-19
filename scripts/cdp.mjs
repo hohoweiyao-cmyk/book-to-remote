@@ -31,9 +31,10 @@
  *   node cdp.mjs kill                     停止专用实例（会连带收走所有标签页）
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, statSync, readdirSync, chmodSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, statSync, readdirSync, chmodSync, rmSync, readlinkSync, openSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -199,6 +200,11 @@ function launch() {
   const cfg = loadConfig();
   const bin = findChrome();
   if (!bin) throw new Error('找不到 Chrome/Chromium，请在配置里指定 chrome_bin：' + CONFIG_PATH);
+  // 端口已有人听 = 实例其实活着（可能只是 CDP 一时忙）。此时再 spawn 一个同 profile 的
+  // Chrome 会撞单例锁，启动即 CHECK 崩溃 → macOS 弹「意外退出」。宁可不拉，也不能撞。
+  if (liveSingletonPid()) {
+    throw new Error(`profile 单例锁仍被 pid ${liveSingletonPid()} 占用，拒绝重复拉起。若确认该进程已死，先 \`node cdp.mjs kill\``);
+  }
   if (!existsSync(cfg.profile_dir)) mkdirSync(cfg.profile_dir, { recursive: true });
   const args = [
     `--user-data-dir=${cfg.profile_dir}`,
@@ -216,9 +222,55 @@ function launch() {
     '--disable-ipc-flooding-protection',
     // 关掉端侧模型下载：实测 OptGuideOnDeviceModel 单个目录能吃到 4.0G
     '--disable-features=OptimizationGuideOnDeviceModel,OptimizationGuideModelDownloading,Translate,MediaRouter,GlobalMediaControls',
+    // 不建 GPU 进程。专用实例是「无窗口 + 后台标签」纯自动化用途，用不到 GPU；而从受管环境
+    // 启动时 Chrome 辅助进程的沙箱初始化会失败（instance.log 里刷 "sandbox initialization
+    // failed: Operation not permitted" → GPU 进程 exit_code=6 反复重启 → 最后
+    // FATAL "GPU process isn't usable. Goodbye." 直接收走浏览器，macOS 就弹「意外退出」）。
+    // 去掉 GPU 进程等于掐掉这条崩溃链，渲染走软件路径，对 z-library / 微信读书 / 亚马逊无影响。
+    '--disable-gpu',
   ];
-  const p = spawn(bin, args, { detached: true, stdio: 'ignore' });
+  // 把 Chrome 自己的 stdout/stderr 落盘。启动期 CHECK 崩溃在系统崩溃报告里是无符号的
+  // （只有一个 ChromeMain 栈），唯一能拿到原因的地方就是这里。stdio:'ignore' 等于把线索丢掉。
+  let stdio = 'ignore';
+  try {
+    const fd = openSync(path.join(CONFIG_DIR, 'instance.log'), 'a');
+    stdio = ['ignore', fd, fd];
+  } catch {}
+  const p = spawn(bin, args, { detached: true, stdio });
   p.unref();
+}
+
+/** SingletonLock 指向的 pid —— 仅当该进程确实还活着时才返回（陈旧锁不算） */
+function liveSingletonPid() {
+  const cfg = loadConfig();
+  try {
+    const t = readlinkSync(path.join(cfg.profile_dir, 'SingletonLock'));   // "host-<pid>"
+    const pid = Number(t.split('-').pop());
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    process.kill(pid, 0);                                                  // 存活探测
+    return pid;
+  } catch { return null; }
+}
+
+/** 端口是否已有人在听。不依赖 HTTP：CDP 忙时 /json/version 会超时，但端口还在 */
+function portListening(port) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host: '127.0.0.1', port });
+    const fin = (v) => { try { s.destroy(); } catch {} resolve(v); };
+    s.once('connect', () => fin(true));
+    s.once('error', () => fin(false));
+    setTimeout(() => fin(false), 1000);
+  });
+}
+
+/** 轮询等健康检查通过 */
+async function waitForHealth(ms) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (await isUp()) return true;
+    await sleep(500);
+  }
+  return await isUp();
 }
 
 /** profile 里只可再生的胖目录（专有 profile，删了 Chrome 会自己重建，不影响登录态） */
@@ -269,20 +321,32 @@ export async function ensureBrowser({ quiet = false } = {}) {
   if (await isUp()) return false;
   if (!cfg.auto_launch) throw new Error(`专用实例未运行，且 auto_launch=false。请手动启动后重试（端口 ${cfg.port}）`);
 
+  // 宽限重试：单次 /json/version 超时（2.5s）常只是实例一时忙（正在收标签页 / GC），
+  // 不代表它没在跑。这里若直接拉起，就会撞上单例锁 → 旧实例崩溃 + 新实例也起不来。
+  if (await waitForHealth(3000)) return false;
+
+  const owner = liveSingletonPid();
+  if (owner || (await portListening(cfg.port))) {
+    if (!quiet) log(`· 端口 ${cfg.port} 已占用（pid ${owner ?? '未知'}），等待实例响应，不重复拉起`);
+    if (await waitForHealth(25000)) { await applyDownloadBehavior(); return false; }
+    throw new Error(
+      `端口 ${cfg.port} 被占用（pid ${owner ?? '未知'}）但 CDP 无响应。\n` +
+      `  先 \`node cdp.mjs kill\`（会等实例真正退出再返回），再重试；\n` +
+      `  想直接看进程：lsof -nP -iTCP:${cfg.port} -sTCP:LISTEN`
+    );
+  }
+
   syncCookies({ verbose: !quiet });
   pruneProfile({ verbose: !quiet });
   launch();
-  const t0 = Date.now();
-  while (Date.now() - t0 < 30000) {
-    await sleep(700);
-    if (await isUp()) {
-      if (!quiet) log(`✓ 专用实例已就绪（端口 ${cfg.port}）`);
-      await applyDownloadBehavior();
-      return true;
-    }
+  if (await waitForHealth(30000)) {
+    if (!quiet) log(`✓ 专用实例已就绪（端口 ${cfg.port}）`);
+    await applyDownloadBehavior();
+    return true;
   }
   throw new Error(
     `拉起专用实例超时（30s，端口 ${cfg.port}）。排查：\n` +
+    `  · Chrome 启动日志（含 CHECK 崩溃原因）：tail -30 "${path.join(CONFIG_DIR, 'instance.log')}"\n` +
     `  · 手动执行看报错："${findChrome()}" --user-data-dir="${cfg.profile_dir}" --remote-debugging-port=${cfg.port}\n` +
     `  · 端口被占：lsof -nP -iTCP:${cfg.port} -sTCP:LISTEN`
   );
@@ -580,14 +644,25 @@ async function cmdSyncCookies() {
 }
 
 async function cmdKill() {
-  const cfg = loadConfig();
   const cdp = await connect().catch(() => null);
   if (cdp) {
     try { await cdp.send('Browser.close'); } catch {}
     cdp.close();
   }
-  await sleep(1500);
-  log(await isUp() ? '· 实例仍在运行（可能有其它窗口），可手动退出' : '✓ 专用实例已停止');
+  // 必须等「实例真的没了 + 单例锁真的释放」再返回。
+  // 只 sleep 1.5s 就返回是错的：紧接着的 ensureBrowser/launch 会 spawn 一个同 profile 的新
+  // Chrome，撞上仍在退出中的旧实例的单例锁 → 新进程启动即 CHECK 崩溃，macOS 弹「意外退出」。
+  // 2026-09-17 实测到过一次（21:02:23 崩溃 / 21:02:53 才拉起成功）。
+  const t0 = Date.now();
+  while (Date.now() - t0 < 20000) {
+    await sleep(500);
+    if (!(await isUp()) && !liveSingletonPid()) break;
+  }
+  const owner = liveSingletonPid();
+  const up = await isUp();
+  if (up) log('· 实例仍在运行（可能有其它窗口），可手动退出');
+  else if (owner) log(`· 实例已退出，单例锁仍挂在 pid ${owner}（残留，下次拉起会自动接管）`);
+  else log('✓ 专用实例已停止');
   return 0;
 }
 

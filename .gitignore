@@ -3,6 +3,21 @@ config.local.json
 *.local.json
 config.env
 
+# 书库索引与溯源记录（含账号内书目、哈希，位置在仓库之外，这里兜底）
+library.json
+*.source.json
+
+# 下载的书（绝不应提交）
+*.epub
+*.mobi
+*.azw3
+*.azw
+*.pdf
+
+# 临时下载中间文件
+*.crdownload
+*.part
+
 # 专用 Chrome profile（内含登录态 cookies）
 chrome-cdp/
 profile/
