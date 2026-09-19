@@ -105,6 +105,27 @@ node "$SKILL/scripts/cdp.mjs" new "https://z-lib.sk/"   # 开一个窗口，用�
   ```
   用户操作完，关掉标签即可；下一个自动化命令会照常把窗口移回屏外。`front <target>` 是更轻的版本（只切前台、不改位置），用于后台限速卡住的兜底。
 
+### 为什么不改用通用 browser skill（2026-09-19 实测，勿重做）
+
+通用浏览器自动化 skill 对本任务链条**不适用**，三条路都实测过：
+
+| 方案 | 实测结果 |
+|---|---|
+| `agent-browser`（vercel-labs） | ❌ 启动即 `--headless=new` + 临时 profile（`/var/folders/.../T/agent-browser-chrome-<uuid>`），访问 `z-lib.sk` 直接 **`Access Denied \| DiamWall`**。Z-Library 的 DiamWall 拒 headless，且临时 profile 无登录态 |
+| `playwright-cli` 默认模式 | ❌ 同上（默认 profile 在内存里，用完即焚），每次都要重新登录三个站点 |
+| `playwright-cli connectOverCDP` | ⚠️ 能挂到本文件的实例上（实测 28ms），但**这只是换个客户端**，浏览器仍要开 —— 无净收益 |
+
+根因：本任务依赖**持久登录态 + headed 浏览器**，而通用 skill 默认给的是**一次性 headless**。
+本方案的窗口"屏外不可见"不等于 headless，它是 headed 的，所以 DiamWall 放行。
+
+**想用 playwright 的 API** 不必换 skill，直接挂到已有实例：
+
+```js
+const { chromium } = require('<playwright-core 路径>');
+const browser = await chromium.connectOverCDP('http://127.0.0.1:9444');
+// 复用同一 profile、同一登录态；browser.close() 只断连，不杀实例
+```
+
 ### 已废弃：常驻代理 + 弹窗自动点击（2026-09-17 弃用，勿重做）
 
 上一版曾用「CDP 代理常驻 + AppleScript 每 3s 扫弹窗自动点允许」来解决重复授权。**已废弃** ——
