@@ -51,12 +51,29 @@ const DEFAULTS = {
   source_profile: 'Default',
   download_dir: '',
   auto_launch: true,
+  // 空闲多久自动释放专用实例（秒）。见文件末尾「为什么要自动释放」的说明。
+  // 设为 0 表示永不自动释放（不建议：会长期挡住用户自己的 Chrome）。
+  idle_release_seconds: 600,
 };
+
+// 最近一次 CDP 活动的时间戳，供看门狗判断实例是否已空闲
+const ACTIVITY_PATH = path.join(CONFIG_DIR, 'last-activity');
+const WATCHDOG_PID_PATH = path.join(CONFIG_DIR, 'watchdog.pid');
 
 // 刻意不 return：process.stdout.write 返回布尔值，透传出去会被赋给 process.exitCode 而报警
 export const log = (m) => { process.stdout.write(m + '\n'); };
 export const warn = (m) => { process.stderr.write('[warn] ' + m + '\n'); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 记一次 CDP 活动。任何一条 cdp.mjs 命令最终都会 connect()，所以这是天然的「有人在用」信号。 */
+function touchActivity() {
+  try { writeFileSync(ACTIVITY_PATH, String(Date.now())); } catch {}
+}
+
+/** 距上次 CDP 活动过了多少秒；从未记录过则返回 Infinity（视为可以立即释放） */
+function idleSeconds() {
+  try { return (Date.now() - Number(readFileSync(ACTIVITY_PATH, 'utf8'))) / 1000; } catch { return Infinity; }
+}
 
 // ---------------- 配置 ----------------
 
@@ -238,6 +255,75 @@ function launch() {
   } catch {}
   const p = spawn(bin, args, { detached: true, stdio });
   p.unref();
+  startWatchdog();
+}
+
+/**
+ * 为什么要自动释放（2026-09-20 实测确认的一个严重副作用）：
+ *
+ * 专用实例和用户日常 Chrome 是同一个 app bundle（com.google.Chrome），所以它在
+ * LaunchServices 里注册成"Chrome 的前台应用实例"。只要它还活着，macOS 处理"点 Dock
+ * 图标 / Spotlight / open -a"时就只会把请求交给它，**不会启动用户的日常 Chrome**；
+ * 而它带 --no-startup-window 且窗口早被 hideWindows 挪出屏幕，实测对 reopen 事件
+ * 也不建窗口 → 屏幕上什么都不出现，用户感受就是「浏览器点击没反应」。
+ *
+ * 实测：实例存活时 `open -a "Google Chrome"` 退出码 0 但新增进程数 0；
+ * 释放该实例后立刻正常拉起日常 Chrome（11 个 renderer）。
+ *
+ * 结论：常驻省下的那几秒冷启动，不值得让用户失去浏览器。默认空闲 10 分钟即自动让位，
+ * 且任务收尾应主动 `kill`（见 SKILL.md）。
+ */
+let watchdogStarted = false;     // 同一进程内只 spawn 一次（launch 可能被不同入口重复触发）
+
+function startWatchdog() {
+  if (watchdogStarted) return;
+  const cfg = loadConfig();
+  const ttl = Number(cfg.idle_release_seconds ?? DEFAULTS.idle_release_seconds);
+  if (!(ttl > 0)) return;
+  // 已有看门狗在跑就不重复 spawn
+  try {
+    const old = Number(readFileSync(WATCHDOG_PID_PATH, 'utf8'));
+    if (old > 0) { process.kill(old, 0); return; }
+  } catch {}
+  watchdogStarted = true;
+  const p = spawn(process.execPath, [fileURLToPath(import.meta.url), 'watchdog', '--ttl', String(ttl)], {
+    detached: true, stdio: 'ignore',
+  });
+  p.unref();
+}
+
+/** 释放实例后把看门狗也一并收走，免得它空转一轮（最多 30s）才自己发现 */
+function reapWatchdogs() {
+  try {
+    const pid = Number(readFileSync(WATCHDOG_PID_PATH, 'utf8'));
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) process.kill(pid);
+  } catch {}
+  try { rmSync(WATCHDOG_PID_PATH, { force: true }); } catch {}
+}
+
+/** 看门狗：空闲超过 TTL 就主动释放实例，把 Chrome 的「应用身份」还回给用户 */
+async function cmdWatchdog(argv) {
+  const i = argv.indexOf('--ttl');
+  const cfg = loadConfig();
+  const ttl = i >= 0 ? Number(argv[i + 1]) : Number(cfg.idle_release_seconds ?? DEFAULTS.idle_release_seconds);
+  try { writeFileSync(WATCHDOG_PID_PATH, String(process.pid)); } catch {}
+  // 短 TTL（测试用）也要能及时响应，所以检查间隔随 TTL 收缩，上限 30s
+  const interval = Math.max(2000, Math.min(30000, (ttl * 1000) / 4));
+  try {
+    for (;;) {
+      await sleep(interval);
+      // 实例已经不在了（用户自己退出 / 被 kill）→ 收工
+      if (!(await isUp()) && !liveSingletonPid()) return 0;
+      if (idleSeconds() > ttl) {
+        const ttlText = ttl >= 60 ? `${Math.round(ttl / 60)} 分钟` : `${ttl} 秒`;
+        log(`· 专用实例已空闲超过 ${ttlText}，自动释放（把 Chrome 的应用身份还给日常浏览器）`);
+        await releaseInstance({ quiet: true });
+        return 0;
+      }
+    }
+  } finally {
+    try { rmSync(WATCHDOG_PID_PATH, { force: true }); } catch {}
+  }
 }
 
 /** SingletonLock 指向的 pid —— 仅当该进程确实还活着时才返回（陈旧锁不算） */
@@ -397,6 +483,7 @@ export async function showWindow(targetId) {
 export async function connect() {
   const h = await health();
   if (!h) throw new Error('专用实例未就绪，请先调用 ensureBrowser() 或运行 `node cdp.mjs ensure`');
+  touchActivity();                 // 有人连上来 = 有人在用，重置空闲计时
   const ws = new WebSocket(h.wsUrl);
   let id = 0;
   const pending = new Map();
@@ -643,7 +730,7 @@ async function cmdSyncCookies() {
   return syncCookies({ verbose: true }) ? 0 : 1;
 }
 
-async function cmdKill() {
+async function releaseInstance({ quiet = false } = {}) {
   const cdp = await connect().catch(() => null);
   if (cdp) {
     try { await cdp.send('Browser.close'); } catch {}
@@ -660,11 +747,15 @@ async function cmdKill() {
   }
   const owner = liveSingletonPid();
   const up = await isUp();
+  if (!up) reapWatchdogs();     // 实例真没了，看门狗也没事可做
+  if (quiet) return 0;
   if (up) log('· 实例仍在运行（可能有其它窗口），可手动退出');
   else if (owner) log(`· 实例已退出，单例锁仍挂在 pid ${owner}（残留，下次拉起会自动接管）`);
-  else log('✓ 专用实例已停止');
+  else log('✓ 专用实例已停止 —— Chrome 的应用身份已还给日常浏览器');
   return 0;
 }
+
+async function cmdKill() { return releaseInstance(); }
 
 async function cmdPrune() {
   if (await isUp()) {
@@ -685,7 +776,8 @@ async function main() {
   ensure                    确保实例就绪（没跑就自动拉起）
   sync-cookies              从日常 Chrome 重新同步登录态（实例须已停止）
   prune                     清理 profile 里的可再生缓存（实例须已停止）
-  kill                      停止专用实例
+  kill                      停止专用实例，把 Chrome 的应用身份还给日常浏览器
+  watchdog                  内部用：空闲看门狗（实例常驻时自动让位，勿手动调）
   tabs                      列出标签页
   new <url>                 新建后台标签页（不抢焦点），输出 targetId
   eval <target> <expr>      在标签页里求值
@@ -703,7 +795,7 @@ async function main() {
 
   // 除「管理实例本身」的命令外，其余命令都自动拉起实例。
   // 否则冷机状态下 `cdp.mjs new` 会直接报「实例未就绪」，破坏「零前置步骤」的承诺。
-  const MANAGES_INSTANCE = new Set(['check', 'bootstrap', 'ensure', 'sync-cookies', 'prune', 'kill']);
+  const MANAGES_INSTANCE = new Set(['check', 'bootstrap', 'ensure', 'sync-cookies', 'prune', 'kill', 'watchdog']);
   if (cmd && !MANAGES_INSTANCE.has(cmd)) {
     await ensureBrowser({ quiet: true });
     // show 有意让窗口可见。CDP_NO_HIDE=1 供「用户正在手动登录/操作」期间临时关掉自动隐藏，
@@ -718,6 +810,7 @@ async function main() {
     case 'sync-cookies': return cmdSyncCookies();
     case 'prune': return cmdPrune();
     case 'kill': return cmdKill();
+    case 'watchdog': return cmdWatchdog(argv);
     case 'tabs': return log((await listTabs()).map((t) => `${t.id}\t${t.title}\t${t.url}`).join('\n'));
     case 'new': return log(await newTab(argv[0] || 'about:blank'));
     case 'eval': return log(String(await evalIn(argv[0], argv.slice(1).join(' ')))?.slice(0, 4000));

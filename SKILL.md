@@ -20,6 +20,7 @@ agent_created: true
 | 需要 Z-Library.app 吗？ | **不需要**。APP 的唯一作用只是「存凭据」。现在凭据由本地私有配置持有，来源可以是浏览器登录（`login`）或从已装的 APP 导入（`import-app`）。 |
 | 下载为什么要用浏览器？ | z-library 的 `/dl` 有 JS 反爬盾，curl 与无头浏览器都过不去（实测 headless 拿到 `Access Denied` / `Try again later`）。**必须真实有头浏览器环境**。 |
 | 会弹窗抢本机使用吗？ | **不会**。专用 Chrome 实例用 `--no-startup-window` 启动（启动即零窗口），所有标签页用 `background: true` 创建，不抢焦点。 |
+| 会影响用户自己的 Chrome 吗？ | **任务期间会**：实例活着时占住了 `com.google.Chrome` 的应用身份，用户点 Dock **打不开自己的浏览器**。所以**收尾必须执行「步骤 9」的 `cdp.mjs kill`**，另有 10 分钟空闲看门狗兜底。机理与实测见下文「实例常驻会挡住用户自己的 Chrome」。 |
 | 用哪个域名？ | 只用官方客户端下发的权威域名（首选 `z-lib.sk`）。**已剔除 `z-library.ec`**——该域被 Cloudflare 标记为 `Suspected Phishing`。 |
 | 需要用户做什么？ | **只要机器上有任一 Chromium 系浏览器**。不用开任何开关、不用给系统权限、不用点任何弹窗。一次性 `cdp.mjs bootstrap` 之后全自动——见下方「浏览器方案」。 |
 | Kindle 走邮件还是网页投送？ | **默认邮件（7A）**。邮件走不通时先**引导用户完成亚马逊配置（7A-0）**，而不是直接降级。**仅两种情况**才用网页投送：① 文件 > 5.25MB（邮件上传实测上限）；② 用户**明确拒绝**配置。用户沉默 ≠ 拒绝，须等待。详见步骤 7 的「投送路由硬规则」。 |
@@ -83,7 +84,7 @@ node "$SKILL/scripts/cdp.mjs" bootstrap
 用「辅助功能权限 + AppleScript 自动点允许」确实能绕过去，但那**本身就要用户做一次系统授权**，
 不满足「全程零授权」——所以本 skill 不走这条路。
 
-### 四条硬约束（改 `cdp.mjs` 前必读，都是实测结论）
+### 五条硬约束（改 `cdp.mjs` 前必读，都是实测结论）
 
 | 约束 | 原因 |
 |------|------|
@@ -91,6 +92,47 @@ node "$SKILL/scripts/cdp.mjs" bootstrap
 | **必须 `--no-startup-window`** | 启动时不创建任何窗口 → 用户完全无感。少了它每次拉起都会闪一个窗口 |
 | **不能用无头模式** | `--headless=new` 会被 Z-Library 的 DiamWall 直接判成 `Access Denied`。必须是有头浏览器 |
 | **窗口不能靠 CDP 最小化** | `Browser.setWindowBounds({windowState:'minimized'})` 在 macOS 无效；只能把 `left` 推到屏外 |
+| **实例不能长期常驻** | 它会占住 Chrome 的应用身份，导致用户点 Dock 打不开自己的浏览器。**任务收尾必须 `kill`**，另有空闲看门狗兜底。详见下节 |
+
+### ⚠️ 实例常驻会挡住用户自己的 Chrome（2026-09-20 实测，必读）
+
+**症状**：用户点 Dock 图标 / Spotlight / 「打开方式」启动 Chrome，**什么都不发生**（既无窗口也无报错）。
+
+**原理**：专用实例与用户日常 Chrome 是**同一个 app bundle**（`com.google.Chrome`），它因此在
+LaunchServices 里注册成「Chrome 的应用实例」。只要它还活着，macOS 处理「打开 Chrome」时就只会
+把请求交给它，**不会启动用户的日常 Chrome**；而它带 `--no-startup-window`、窗口又被 `hideWindows`
+挪出屏外，实测对 reopen 事件**也不建窗口** → 屏幕上什么都不出现。
+
+**实测证据**（2026-09-20）：
+
+| 操作 | 结果 |
+|------|------|
+| 实例存活时 `open -a "Google Chrome"` | 退出码 0，但**新增 Chrome 进程数 = 0**，专用实例 target 数仍为 0 |
+| `cdp.mjs kill` 之后同一条命令 | 立刻拉起用户日常 Chrome（11 个 renderer） |
+| `lsappinfo info -only pid com.google.Chrome` | 实例存活时指向**专用实例**，释放后指回日常实例 |
+
+注意触发条件是**日常 Chrome 已经不在运行**。如果用户的 Chrome 正开着，点 Dock 会激活那个有窗口的
+实例，看起来正常——所以这个坑常在用户「关掉 Chrome 之后想再打开」时才暴露。
+
+**为什么不能靠「常驻」换速度**：常驻省下的只有几秒冷启动（实测 `ensure` 冷启 ~3–5s），代价却是
+用户随时可能打不开浏览器。**这个交换不划算，永远不常驻。**
+
+**两层防护（都已落地，别再退回去）**：
+
+1. **空闲看门狗**：`launch()` 会随着实例一起拉起一个 detached 看门狗（`cdp.mjs watchdog`），
+   空闲超过 `idle_release_seconds`（默认 **600 秒**）就自动释放实例。活动时间戳在每次
+   `connect()` 时刷新，所以只有真的没人用才会触发。关掉：把配置里该项设为 `0`（不建议）。
+2. **任务收尾主动释放**：流程最后一步执行 `cdp.mjs kill`（见「步骤 9」）。正常路径下用户
+   **完全感觉不到**实例存在过。
+
+**用户报「Chrome 打不开」时的一键处置**：
+
+```bash
+node "$SKILL/scripts/cdp.mjs" kill     # 释放实例，Chrome 的应用身份立刻还给日常浏览器
+```
+
+执行后让用户再点一次图标即可；若仍无反应，先确认没有残留实例：
+`ps -eo command | grep "[C]hrome" | grep chrome-cdp`。
 
 ### 登录态从哪来
 
@@ -118,7 +160,7 @@ node "$SKILL/scripts/cdp.mjs" new "https://z-lib.sk/"   # 开一个窗口，用�
 - **端侧模型要关掉**。启动参数里带了 `--disable-features=OptimizationGuideOnDeviceModel,OptimizationGuideModelDownloading,...`；不加的话 Chrome 会后台偷下端侧模型，实测 `OptGuideOnDeviceModel` 单目录吃到 **4.0G**。`node cdp.mjs prune` 可清理这类可再生缓存。
 - **换浏览器**：改 `~/.workbuddy/chrome-cdp/config.local.json` 的 `chrome_bin` 即可（任何 Chromium 系都行，不要求是用户的日常浏览器）。
 - **改端口**：同文件的 `port`，默认 `9444`（刻意避开 9222，避免和用户日常 Chrome 抢端口）。
-- **`cdp.mjs` 的每个业务子命令都会自动拉起实例**（`new` / `eval` / `nav` / `cookies` / `click` / `clickat` / `shot` / `setfiles` / `close` / `tabs`），冷机状态下直接敲就行，不必先 `ensure`。只有管理实例本身的命令不自动拉起：`check` / `bootstrap` / `ensure` / `sync-cookies` / `prune` / `kill`。
+- **`cdp.mjs` 的每个业务子命令都会自动拉起实例**（`new` / `eval` / `nav` / `cookies` / `click` / `clickat` / `shot` / `setfiles` / `close` / `tabs`），冷机状态下直接敲就行，不必先 `ensure`。只有管理实例本身的命令不自动拉起：`check` / `bootstrap` / `ensure` / `sync-cookies` / `prune` / `kill` / `watchdog`。
 - **`sync-cookies` 与 `prune` 必须先 `kill`**：实例运行时会回写 Cookies、并锁住缓存目录，边跑边覆盖等于白做。脚本会直接拒绝并提示。`zlib-cdp.mjs` 的自动拉起里已内置这两个动作，所以日常路径碰不到这个坑。
 - **需要用户亲自操作时（登录 / 过验证码）**：`cdp.mjs show <target>` 把窗口挪回屏幕内并置顶（`new` 建的是后台标签、窗口默认在屏外）。**用户操作期间的所有 `cdp.mjs` 调用都要加 `CDP_NO_HIDE=1`**，否则自动隐藏会把用户正在填的窗口又挪走：
   ```bash
@@ -262,6 +304,9 @@ node "$SKILL/scripts/verify-ebook.mjs" "$HOME/Downloads/书名.epub"
 
 # 附：查看已下载书目与溯源信息（sha256 / 来源 id / 校验级别）
 node "$SKILL/scripts/zlib-cdp.mjs" library
+
+# 7) 收尾：释放专用实例，把 Chrome 的应用身份还给用户（必做，见「步骤 9」）
+node "$SKILL/scripts/cdp.mjs" kill
 ```
 
 **投送阶段的顺序（先把邮件路的配置一次做齐，之后每本书都省事）**：
@@ -600,11 +645,30 @@ node "<skill_dir>/scripts/cdp.mjs" close "$T"
 
 ---
 
+### 步骤 9：收尾释放实例（**必做，别省**）
+
+```bash
+node "<skill_dir>/scripts/cdp.mjs" kill
+```
+
+**为什么必须做**：专用实例活着的时候会占住 `com.google.Chrome` 这个应用身份，用户此时
+**点 Dock 打不开自己的 Chrome**（详细机理见上文「实例常驻会挡住用户自己的 Chrome」）。
+
+- 不释放的后果：用户想用浏览器时发现点了没反应，只能等你下次跑 skill 或等看门狗超时（默认 10 分钟）。
+- 释放的成本：下次任务冷启动多 ~3–5 秒。**用 3 秒换用户随时能用浏览器，必须换。**
+- 兜底：即使忘了释放，空闲看门狗也会在 `idle_release_seconds`（默认 600s）后自动释放。
+  但这不该成为不释放的理由——**默认路径就该是收尾即释放**。
+
+> 若本轮要**连续处理多本书**，可以中途不释放（省几次冷启动），但**整批做完必须补一次 `kill`**。
+> 判断当前是否有实例在跑：`ps -eo command | grep "[C]hrome" | grep chrome-cdp`。
+
+---
+
 ## 脚本清单与定位
 
 | 脚本 | 定位 |
 |------|------|
-| `cdp.mjs` | **浏览器层（自包含）**。实例守卫（自动拉起 / 迁移登录态 / 移走窗口 / 清理缓存）+ 直连 CDP 客户端。子命令跑 `node cdp.mjs` 查看 |
+| `cdp.mjs` | **浏览器层（自包含）**。实例守卫（自动拉起 / 迁移登录态 / 移走窗口 / 清理缓存 / 空闲自动释放）+ 直连 CDP 客户端。子命令跑 `node cdp.mjs` 查看 |
 | `zlib-cdp.mjs` | **业务主入口**。check / setup / login / import-app / search / download / library。下载环节自带内容关卡、原子发布与幂等 |
 | `ebook-format.mjs` | **格式判定共用层**。按文件头嗅探真实格式 + EPUB 容器(OCF)校验 + SHA-256。被 `verify-ebook.mjs` 与 `zlib-cdp.mjs` 共用，避免两处判定不一致 |
 | `verify-ebook.mjs` | 交付前校验（引用共用层），输出 `validation` 分级与投送路由 |
@@ -632,6 +696,9 @@ node "<skill_dir>/scripts/cdp.mjs" close "$T"
 | 探测本地端口得到 `502 upstream connect failed` | 环境变量 `HTTP_PROXY` 劫持了 localhost 请求。用 `env -u HTTP_PROXY ... curl`，或直接用 node fetch（node 不读这个变量） |
 | 每次还要弹授权框 / 手点「允许」 | 说明走回了「连日常 Chrome」的老路。检查是否误用 9222 或第三方 CDP 代理；本 skill 只应连 9444 的专用实例 |
 | 专用实例的窗口冒出来了 | 只可能是手动跑了 `cdp.mjs new`。自动化路径用 `background:true` 建标签，不会出现窗口；`cdp.mjs ensure` 会把窗口移到屏外 |
+| **用户报「点 Chrome 图标没反应 / 浏览器打不开」** | **本 skill 的已知副作用**。专用实例活着时占住了 `com.google.Chrome` 的应用身份，且它无窗口、不响应 reopen，所以点 Dock 什么都不出现（2026-09-20 实测：`open -a` 退出码 0 但新增进程数 0）。**处置：立刻 `node "<skill_dir>/scripts/cdp.mjs" kill`**，然后让用户再点一次，通常立刻就开。根治：任务收尾必须执行「步骤 9」释放实例 |
+| 想确认此刻有没有实例占着 Chrome | `ps -eo command \| grep "[C]hrome" \| grep chrome-cdp`；`lsappinfo info -only pid com.google.Chrome` 看应用身份当前归谁 |
+| 看门狗误杀正在进行的任务 | 不该发生：TTL 默认 600s，而单次 CDP 空闲实测不超过 ~90s（下载轮询上限）。若确有长任务，临时调大 `idle_release_seconds` 或设 `0` 关闭自动释放 |
 | profile 体积暴涨到几个 G | Chrome 后台偷下端侧模型（`OptGuideOnDeviceModel`，实测 **4.0G**）。启动参数已禁；`cdp.mjs prune` 清理已有缓存 |
 | 域名页显示 `Suspected Phishing` | 该域被 Cloudflare 标记，**不要用**（如 `z-library.ec`）；脚本已剔除，只在候选表里手动加回过才可能遇到 |
 | 下载 90s 超时且目录无新文件 | 已用 `Browser.setDownloadBehavior` 强制落盘，不再受「下载前询问保存位置」影响。仍超时则查：当日额度是否用完 / 域名是否被墙 |
