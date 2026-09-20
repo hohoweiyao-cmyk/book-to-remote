@@ -36,16 +36,27 @@ import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 
 const HOME = homedir();
 const CONFIG_DIR = path.join(HOME, '.workbuddy', 'chrome-cdp');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.local.json');
+// Playwright 分发浏览器的地方（跨平台）。用户没装任何浏览器时，就靠这里的 Chromium 兜底。
+const PLAYWRIGHT_CACHE = process.platform === 'darwin'
+  ? path.join(HOME, 'Library', 'Caches', 'ms-playwright')
+  : process.platform === 'win32'
+    ? path.join(process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local'), 'ms-playwright')
+    : path.join(process.env.XDG_CACHE_HOME || path.join(HOME, '.cache'), 'ms-playwright');
+// 本机受管 Node 的 workspace（zlib-browser-dl.mjs 也从这里解析 playwright）
+const NODE_WORKSPACE = path.join(HOME, '.workbuddy', 'binaries', 'node', 'workspace');
 
 const DEFAULTS = {
   _comment: '专用 Chrome 实例的本地配置。位于 skill 仓库之外，请勿提交到任何仓库。',
   port: 9444,
-  profile_dir: path.join(HOME, '.workbuddy', 'chrome-cdp', 'profile'),
+  // 留空 = 按浏览器身份自动推导（见 computeProfileDir）。**不要**把两种身份的浏览器指向
+  // 同一个目录，否则会因为 cookie 加密密钥不同而互相清空登录态（实测见 computeProfileDir 注释）。
+  profile_dir: '',
   chrome_bin: '',
   source_root: '',
   source_profile: 'Default',
@@ -77,14 +88,23 @@ function idleSeconds() {
 
 // ---------------- 配置 ----------------
 
+/** 只读原始配置文件、不补默认值。给 resolveBrowser() 用，避免与 loadConfig() 互相递归。 */
+function peekConfig() {
+  if (!existsSync(CONFIG_PATH)) return {};
+  try { return JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) || {}; } catch { return {}; }
+}
+
 export function loadConfig() {
-  if (!existsSync(CONFIG_PATH)) return { ...DEFAULTS };
-  try {
-    return { ...DEFAULTS, ...JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) };
-  } catch (e) {
-    warn('CDP 配置损坏，改用默认值：' + e.message);
-    return { ...DEFAULTS };
+  let raw;
+  if (!existsSync(CONFIG_PATH)) raw = {};
+  else {
+    try { raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) || {}; }
+    catch (e) { warn('CDP 配置损坏，改用默认值：' + e.message); raw = {}; }
   }
+  const cfg = { ...DEFAULTS, ...raw };
+  // profile_dir 留空 = 按浏览器身份推导（两种身份不能共用一个目录，见 computeProfileDir）
+  if (!cfg.profile_dir) cfg.profile_dir = computeProfileDir(resolveBrowser()?.kind || 'system');
+  return cfg;
 }
 
 export function saveConfig(cfg) {
@@ -94,21 +114,117 @@ export function saveConfig(cfg) {
   try { chmodSync(CONFIG_PATH, 0o600); } catch {}
 }
 
-// ---------------- Chrome 与 profile 定位 ----------------
+// ---------------- 浏览器与 profile 定位 ----------------
 
+/**
+ * 系统已装的 Chromium 系浏览器。**优先用它**：它能复用从用户日常 Chrome 同步来的登录态
+ * （同一个 app 身份 = 同一把 Keychain cookie 密钥，文件级复制就能生效）。
+ */
 const CHROME_CANDIDATES = [
+  // macOS
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/Applications/Chromium.app/Contents/MacOS/Chromium',
   '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
   '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
   path.join(HOME, 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+  // Linux
+  '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium',
+  '/opt/google/chrome/chrome',
+  // Windows
+  path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google/Chrome/Application/chrome.exe'),
+  path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google/Chrome/Application/chrome.exe'),
+  path.join(process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local'), 'Google/Chrome/Application/chrome.exe'),
+  path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Microsoft/Edge/Application/msedge.exe'),
 ];
 
-export function findChrome() {
-  const cfg = loadConfig();
-  if (cfg.chrome_bin && existsSync(cfg.chrome_bin)) return cfg.chrome_bin;
-  for (const p of CHROME_CANDIDATES) if (existsSync(p)) return p;
+/** Playwright 自带的 Chromium（Chrome for Testing 构建）在各平台下的相对路径 */
+const BUNDLED_RELS = [
+  'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+  'chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+  'chrome-mac/Chromium.app/Contents/MacOS/Chromium',
+  'chrome-linux64/chrome', 'chrome-linux/chrome',
+  'chrome-win64/chrome.exe', 'chrome-win/chrome.exe',
+];
+
+/** 路径是否属于 Playwright 分发的浏览器（用来判定身份） */
+function isBundledBin(p) {
+  return /ms-playwright|Chrome for Testing|chrome-linux|chrome-win/i.test(p || '');
+}
+
+/**
+ * Playwright 随包分发的 Chromium —— **用户没装任何浏览器时的兜底**。
+ *
+ *   · 不依赖用户装过什么：这是「零前提」的来源，Safari / Firefox 用户也能跑
+ *   · bundle id 是 com.google.chrome.for.testing，与用户的 com.google.Chrome 不同
+ *     → 不会抢占用户浏览器的应用身份（实测两者可同时在线互不干扰）
+ *   · 但**读不到系统 Chrome 写的 cookie**（Keychain 密钥按 app 身份隔离）→ 必须用独立 profile
+ */
+export function findBundledChromium() {
+  // 1) 先问 Playwright 官方 API：它自己维护 revision 目录名，比手工拼路径稳
+  try {
+    const req = createRequire(path.join(NODE_WORKSPACE, 'package.json'));
+    for (const mod of ['playwright', 'playwright-core']) {
+      try {
+        const p = req(mod)?.chromium?.executablePath?.();
+        if (p && existsSync(p)) return p;
+      } catch { /* 该模块没装，试下一个 */ }
+    }
+  } catch { /* workspace 不存在 */ }
+  // 2) Playwright 没装或 API 不可用 → 直接扫它的缓存目录，取 revision 最大的
+  let revs;
+  try {
+    revs = readdirSync(PLAYWRIGHT_CACHE).filter((d) => /^chromium[-_]/.test(d) && !/headless/.test(d));
+  } catch { return null; }
+  revs.sort((a, b) => Number((b.match(/\d+/) || [0])[0]) - Number((a.match(/\d+/) || [0])[0]));
+  for (const rev of revs) {
+    for (const rel of BUNDLED_RELS) {
+      const p = path.join(PLAYWRIGHT_CACHE, rev, rel);
+      if (existsSync(p)) return p;
+    }
+  }
   return null;
+}
+
+/**
+ * 选一个可执行的浏览器，并给出它的「身份」。身份决定两件事：用哪个 profile、登录态能不能同步。
+ *
+ *   kind='system'  → 系统已装的 Chromium 系。与用户日常 Chrome 共享 cookie 密钥，
+ *                    `sync-cookies` 的文件级复制有效。
+ *   kind='bundled' → Playwright 自带的 Chrome for Testing。密钥独立，**同步过来也读不了**，
+ *                    必须在它自己的实例里登录一次。
+ */
+export function resolveBrowser() {
+  const raw = peekConfig();
+  if (raw.chrome_bin && existsSync(raw.chrome_bin)) {
+    return { bin: raw.chrome_bin, kind: isBundledBin(raw.chrome_bin) ? 'bundled' : 'system', source: 'config' };
+  }
+  for (const p of CHROME_CANDIDATES) if (existsSync(p)) return { bin: p, kind: 'system', source: 'system' };
+  const b = findBundledChromium();
+  if (b) return { bin: b, kind: 'bundled', source: 'playwright' };
+  return null;
+}
+
+/** 兼容旧调用点：只要可执行路径 */
+export function findChrome() {
+  return resolveBrowser()?.bin || null;
+}
+
+/**
+ * profile 目录按浏览器身份分开 —— **必须分开**。
+ *
+ * macOS 上 Chromium 系的 cookie 加密密钥存在 Keychain，条目名由 app 身份（product name）
+ * 决定，不同 bundle 的浏览器拿不到彼此的密钥。共用同一个 profile 目录时，Chrome 不报错，
+ * 而是**直接把 cookie 库清空重建**。实测（2026-09-20）：把 751 条 cookie（含微信读书
+ * wr_vid、亚马逊 at-main）的 profile 交给 Playwright 的 Chrome for Testing 启动，
+ * 无论 151 还是 153 版，启动后都变成 0 条（源 profile 不受影响）。
+ * 所以两种身份一旦共用目录，就会互相摧毁登录态。
+ */
+function computeProfileDir(kind) {
+  return kind === 'bundled'
+    ? path.join(CONFIG_DIR, 'profile-bundled')
+    : path.join(CONFIG_DIR, 'profile');
 }
 
 /** 用户日常 Chrome 的 user-data-dir 根目录 */
@@ -132,6 +248,20 @@ export function findSourceRoot() {
  */
 export function syncCookies({ verbose = true } = {}) {
   const cfg = loadConfig();
+  // 文件级复制只在同一 app 身份内有效（cookie 密钥存在 Keychain，条目名由 app 身份决定）。
+  // Playwright 自带的 Chromium 与日常 Chrome 的密钥不同，复制过去也解不开，白费一次拷贝。
+  const browser = resolveBrowser();
+  if (browser?.kind === 'bundled') {
+    const hasCookies = existsSync(path.join(cfg.profile_dir, 'Default', 'Cookies'));
+    if (!hasCookies && verbose) {
+      warn('当前使用 Playwright 自带的 Chromium —— 它与日常 Chrome 的 cookie 密钥不同，无法同步登录态。');
+      warn('  这是预期行为（同一 profile 目录跨 app 使用会互相清空 cookie，实测过）。');
+      warn('  首次使用请在这个专用实例里登录一次，之后长期有效：');
+      warn('    · Z-Library：不需要登录（走 API 凭据）');
+      warn('    · 微信读书 / 亚马逊(Send to Kindle)：需要在专用实例的窗口里各登录一次');
+    }
+    return false;
+  }
   const root = findSourceRoot();
   if (!root) { warn('找不到日常 Chrome 的数据目录，跳过登录态同步'); return false; }
 
@@ -215,8 +345,16 @@ export async function isUp() { return !!(await health()); }
 
 function launch() {
   const cfg = loadConfig();
-  const bin = findChrome();
-  if (!bin) throw new Error('找不到 Chrome/Chromium，请在配置里指定 chrome_bin：' + CONFIG_PATH);
+  const b = resolveBrowser();
+  if (!b) {
+    throw new Error(
+      '找不到任何可用的浏览器。两种解决方式任选其一：\n' +
+      `  · 装一个 Chrome / Chromium / Edge；或在配置里显式指定 chrome_bin（${CONFIG_PATH}）\n` +
+      '  · 用 Playwright 自带的 Chromium（不依赖用户装浏览器，Safari/Firefox 用户也能跑）：\n' +
+      `    cd ${NODE_WORKSPACE} && npm i playwright && npx playwright install chromium`
+    );
+  }
+  const bin = b.bin;
   // 端口已有人听 = 实例其实活着（可能只是 CDP 一时忙）。此时再 spawn 一个同 profile 的
   // Chrome 会撞单例锁，启动即 CHECK 崩溃 → macOS 弹「意外退出」。宁可不拉，也不能撞。
   if (liveSingletonPid()) {
@@ -433,7 +571,7 @@ export async function ensureBrowser({ quiet = false } = {}) {
   throw new Error(
     `拉起专用实例超时（30s，端口 ${cfg.port}）。排查：\n` +
     `  · Chrome 启动日志（含 CHECK 崩溃原因）：tail -30 "${path.join(CONFIG_DIR, 'instance.log')}"\n` +
-    `  · 手动执行看报错："${findChrome()}" --user-data-dir="${cfg.profile_dir}" --remote-debugging-port=${cfg.port}\n` +
+    `  · 手动执行看报错："${resolveBrowser()?.bin || '<未找到浏览器>'}" --user-data-dir="${cfg.profile_dir}" --remote-debugging-port=${cfg.port}\n` +
     `  · 端口被占：lsof -nP -iTCP:${cfg.port} -sTCP:LISTEN`
   );
 }
@@ -659,15 +797,27 @@ export async function waitFor(targetId, expression, { timeout = 60000, interval 
 
 async function cmdCheck() {
   const cfg = loadConfig();
-  const bin = findChrome();
+  const b = resolveBrowser();
   const root = findSourceRoot();
-  log('=== 专用 Chrome 实例自检 ===\n');
+  log('=== 专用浏览器实例自检 ===\n');
   log(`配置文件    : ${CONFIG_PATH} ${existsSync(CONFIG_PATH) ? '' : '（未创建，用默认值）'}`);
-  log(`Chrome 可执行: ${bin || '✗ 未找到'}`);
+  if (b) {
+    log(`浏览器      : ${b.bin}`);
+    log(`身份        : ${b.kind}（来源 ${b.source}）`);
+    log(`              ${b.kind === 'system'
+      ? '系统浏览器 —— 可与日常 Chrome 同步登录态'
+      : 'Playwright 自带 Chromium —— 不依赖用户装浏览器；登录态需在该实例内单独登录'}`);
+  } else {
+    log('浏览器      : ✗ 未找到');
+    log(`              → 装一个 Chrome/Chromium，或执行：`);
+    log(`                cd ${NODE_WORKSPACE} && npm i playwright && npx playwright install chromium`);
+  }
   log(`专用 profile : ${cfg.profile_dir} ${existsSync(cfg.profile_dir) ? '✓ 已存在' : '(未创建，bootstrap 会建)'}`);
   log(`调试端口     : ${cfg.port}`);
   log(`下载目录     : ${getDownloadDir()}`);
-  log(`登录态来源   : ${root ? root + ' / ' + cfg.source_profile : '✗ 未找到日常 Chrome 数据目录'}`);
+  log(`登录态来源   : ${b?.kind === 'bundled'
+    ? '不适用（Playwright Chromium 读不了日常 Chrome 的 cookie，需在实例内单独登录）'
+    : root ? root + ' / ' + cfg.source_profile : '✗ 未找到日常 Chrome 数据目录'}`);
 
   const h = await health();
   if (h) log(`\n✓ 实例在运行：${h.browser}（端口 ${h.port}），WS 通道可用，无需任何授权`);
@@ -676,8 +826,18 @@ async function cmdCheck() {
 }
 
 async function cmdBootstrap() {
-  log('=== 首次部署专用 Chrome 实例 ===\n');
   const cfg = loadConfig();
+  const b = resolveBrowser();
+  log('=== 首次部署专用浏览器实例 ===\n');
+  if (b) {
+    log(`浏览器 : ${b.bin}`);
+    log(`身份   : ${b.kind}（来源 ${b.source}）`);
+    if (b.kind === 'bundled') {
+      log('         Playwright 自带的 Chromium。它读不到日常 Chrome 的 cookie（密钥按 app 身份隔离），');
+      log('         因此下面的核验里有站点会显示未登录 —— 那属于预期，按提示在该实例里登录一次即可。');
+    }
+    log(`profile: ${cfg.profile_dir}\n`);
+  }
   if (!existsSync(cfg.profile_dir)) mkdirSync(cfg.profile_dir, { recursive: true });
 
   if (await isUp()) { await hideWindows(); log('· 实例已在运行，跳过拉起'); }
